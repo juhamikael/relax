@@ -2278,6 +2278,171 @@ pub fn _mm_movehdup_ps(a: __m128) -> __m128 {
     __m128([a.0[1], a.0[1], a.0[3], a.0[3]])
 }
 
+// The SSE3, SSE4.1, AVX and FMA forms rustfft's SSE and AVX paths call, lane by lane as
+// core::arch defines them.
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse3"))]
+pub fn _mm_moveldup_ps(a: __m128) -> __m128 {
+    __m128([a.0[0], a.0[0], a.0[2], a.0[2]])
+}
+
+/// Even lanes `a - b`, odd lanes `a + b`.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse3"))]
+pub fn _mm_addsub_ps(a: __m128, b: __m128) -> __m128 {
+    __m128([a.0[0] - b.0[0], a.0[1] + b.0[1], a.0[2] - b.0[2], a.0[3] + b.0[3]])
+}
+
+/// Lane `i` from `b` where bit `i` of `IMM4` is set, else from `a`.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse4.1"))]
+#[rustc_legacy_const_generics(2)]
+pub fn _mm_blend_ps<const IMM4: i32>(a: __m128, b: __m128) -> __m128 {
+    let mut r = a.0;
+    let mut i = 0;
+    while i < 4 {
+        if IMM4 & (1 << i) != 0 {
+            r[i] = b.0[i];
+        }
+        i += 1;
+    }
+    __m128(r)
+}
+
+/// Lane `i` is `a[(IMM8 >> 2i) & 3]`.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+#[rustc_legacy_const_generics(1)]
+pub fn _mm_permute_ps<const IMM8: i32>(a: __m128) -> __m128 {
+    let pick = |i: i32| a.0[((IMM8 >> (2 * i)) & 3) as usize];
+    __m128([pick(0), pick(1), pick(2), pick(3)])
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub fn _mm_broadcast_ss(f: &f32) -> __m128 {
+    _mm_set1_ps(*f)
+}
+
+/// Even lanes `a * b - c`, odd lanes `a * b + c`, each rounded once.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "fma"))]
+pub fn _mm_fmaddsub_ps(a: __m128, b: __m128, c: __m128) -> __m128 {
+    unsafe {
+        let (add, sub) = (fma_ps(a, b, c, false, false), fma_ps(a, b, c, false, true));
+        __m128([sub.0[0], add.0[1], sub.0[2], add.0[3]])
+    }
+}
+
+/// Even lanes `a * b + c`, odd lanes `a * b - c`, each rounded once.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "fma"))]
+pub fn _mm_fmsubadd_ps(a: __m128, b: __m128, c: __m128) -> __m128 {
+    unsafe {
+        let (add, sub) = (fma_ps(a, b, c, false, false), fma_ps(a, b, c, false, true));
+        __m128([add.0[0], sub.0[1], add.0[2], sub.0[3]])
+    }
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub fn _mm256_moveldup_ps(a: __m256) -> __m256 {
+    let x = a.0;
+    __m256([x[0], x[0], x[2], x[2], x[4], x[4], x[6], x[6]])
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub fn _mm256_movehdup_ps(a: __m256) -> __m256 {
+    let x = a.0;
+    __m256([x[1], x[1], x[3], x[3], x[5], x[5], x[7], x[7]])
+}
+
+/// Lane `i` from `b` where bit `i` of `IMM8` is set, else from `a`.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+#[rustc_legacy_const_generics(2)]
+pub fn _mm256_blend_ps<const IMM8: i32>(a: __m256, b: __m256) -> __m256 {
+    let mut r = a.0;
+    let mut i = 0;
+    while i < 8 {
+        if IMM8 & (1 << i) != 0 {
+            r[i] = b.0[i];
+        }
+        i += 1;
+    }
+    __m256(r)
+}
+
+/// `_mm_permute_ps` on each 128-bit half, with the same `IMM8`.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+#[rustc_legacy_const_generics(1)]
+pub fn _mm256_permute_ps<const IMM8: i32>(a: __m256) -> __m256 {
+    unsafe { ps_join(_mm_permute_ps::<IMM8>(ps_lo(&a)), _mm_permute_ps::<IMM8>(ps_hi(&a))) }
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub fn _mm256_broadcast_ss(f: &f32) -> __m256 {
+    _mm256_set1_ps(*f)
+}
+
+/// The upper half is undefined in core::arch; here it is zero.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub fn _mm256_castps128_ps256(a: __m128) -> __m256 {
+    unsafe { ps_join(a, _mm_setzero_ps()) }
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub fn _mm256_zextps128_ps256(a: __m128) -> __m256 {
+    unsafe { ps_join(a, _mm_setzero_ps()) }
+}
+
+/// `a` with the half `IMM1 & 1` names replaced by `b`.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+#[rustc_legacy_const_generics(2)]
+pub fn _mm256_insertf128_ps<const IMM1: i32>(a: __m256, b: __m128) -> __m256 {
+    unsafe {
+        if IMM1 & 1 == 0 { ps_join(b, ps_hi(&a)) } else { ps_join(ps_lo(&a), b) }
+    }
+}
+
+/// Fused, as `_mm_fmaddsub_ps` on each half.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "fma"))]
+pub fn _mm256_fmaddsub_ps(a: __m256, b: __m256, c: __m256) -> __m256 {
+    unsafe {
+        ps_join(
+            _mm_fmaddsub_ps(ps_lo(&a), ps_lo(&b), ps_lo(&c)),
+            _mm_fmaddsub_ps(ps_hi(&a), ps_hi(&b), ps_hi(&c)),
+        )
+    }
+}
+
+/// Fused, as `_mm_fmsubadd_ps` on each half.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "fma"))]
+pub fn _mm256_fmsubadd_ps(a: __m256, b: __m256, c: __m256) -> __m256 {
+    unsafe {
+        ps_join(
+            _mm_fmsubadd_ps(ps_lo(&a), ps_lo(&b), ps_lo(&c)),
+            _mm_fmsubadd_ps(ps_hi(&a), ps_hi(&b), ps_hi(&c)),
+        )
+    }
+}
+
+/// Two unaligned 128-bit loads: the low half from `loaddr`, the high from `hiaddr`.
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub unsafe fn _mm256_loadu2_m128d(hiaddr: *const f64, loaddr: *const f64) -> __m256d {
+    pd_join(_mm_loadu_pd(loaddr), _mm_loadu_pd(hiaddr))
+}
+
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse"))]
 pub fn _mm_movehl_ps(a: __m128, b: __m128) -> __m128 {
