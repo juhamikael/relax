@@ -2242,6 +2242,19 @@ pub unsafe fn _mm_loadu_ps(mem_addr: *const f32) -> __m128 {
     vx::vx_load(mem_addr as *const u8)
 }
 
+/// One f32 from memory in all four lanes (core::arch: `_mm_set1_ps(*p)`).
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse"))]
+pub unsafe fn _mm_load1_ps(mem_addr: *const f32) -> __m128 {
+    _mm_set1_ps(*mem_addr)
+}
+
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse"))]
+pub unsafe fn _mm_load_ps1(mem_addr: *const f32) -> __m128 {
+    _mm_load1_ps(mem_addr)
+}
+
 // Intel: a < b ? a : b / a > b ? a : b, so either operand NaN returns b.
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse"))]
