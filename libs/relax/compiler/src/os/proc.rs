@@ -929,10 +929,35 @@ mod imp {
         std::ptr::null_mut()
     }
 
-    /// The C runtime and math functions where no loaded module exports them yet.
+    /// The C runtime and math functions where no loaded module exports them yet, then the
+    /// system DLLs windows-sys imports from. Its `link!` (windows-targets) names a function's DLL
+    /// only under `windows_raw_dylib`, a cfg cargo resolves its dependencies by (windows-targets
+    /// 0.53 needs windows-link for it), so Relax cannot set it; otherwise the extern block links
+    /// the import library `windows.0.5x.0`, which names no DLL to load. Such a symbol resolved only
+    /// once other code had loaded its DLL into the process: winit's first `SetWindowTheme`
+    /// (uxtheme.dll) before anything loaded uxtheme panicked as a function this host lacks.
+    /// The DLLs are loaded from System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32), never beside the
+    /// program.
     pub unsafe fn find_system(name: *const u8) -> *mut u8 {
         for lib in ["msvcrt.dll\0", "kernelbase.dll\0", "ntdll.dll\0"] {
             let h = LoadLibraryA(lib.as_ptr());
+            if h != 0 {
+                let p = GetProcAddress(h, name);
+                if !p.is_null() {
+                    return p;
+                }
+            }
+        }
+        const SYSTEM_DLLS: [&str; 30] = [
+            "kernel32", "user32", "gdi32", "uxtheme", "dwmapi", "shell32", "shlwapi", "shcore", "ole32",
+            "oleaut32", "comctl32", "comdlg32", "advapi32", "imm32", "winmm", "avrt", "ws2_32", "bcrypt",
+            "crypt32", "secur32", "userenv", "version", "setupapi", "dbghelp", "propsys", "powrprof",
+            "iphlpapi", "dxgi", "d3d11", "d3d12",
+        ];
+        const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
+        for lib in SYSTEM_DLLS {
+            let wide: Vec<u16> = lib.encode_utf16().chain(".dll".encode_utf16()).chain(Some(0)).collect();
+            let h = LoadLibraryExW(wide.as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32);
             if h != 0 {
                 let p = GetProcAddress(h, name);
                 if !p.is_null() {
