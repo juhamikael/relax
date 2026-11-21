@@ -2275,23 +2275,52 @@ pub fn _mm_min_ps(a: __m128, b: __m128) -> __m128 {
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse3"))]
 pub fn _mm_movehdup_ps(a: __m128) -> __m128 {
-    __m128([a.0[1], a.0[1], a.0[3], a.0[3]])
+    // the odd lanes twice: an i32 shuffle (pshufd 3,3,1,1)
+    unsafe { vx::vx_unary(a, 4, 32, 0xF5) }
 }
 
-// The SSE3, SSE4.1, AVX and FMA forms rustfft's SSE and AVX paths call, lane by lane as
-// core::arch defines them.
+// The SSE3, SSE4.1, AVX and FMA forms rustfft's SSE and AVX paths call, on the bridge's vector
+// operations (shuffles, xor, add, blend, fused multiply-add) as the forms above are: written lane
+// by lane they ran several times slower than these.
+
+/// The sign bit of the even lanes: xor-ed into a vector, it negates its even lanes. A splat of
+/// the 64-bit pattern (a constant array was a load of memory, several times dearer than the
+/// operation it fed).
+#[inline(always)]
+fn sign_even() -> __m128 {
+    unsafe { vx::vx_splat(0x0000_0000_8000_0000, 64) }
+}
+
+/// The sign bit of the odd lanes.
+#[inline(always)]
+fn sign_odd() -> __m128 {
+    unsafe { vx::vx_splat(0x8000_0000_0000_0000, 64) }
+}
+
+/// All bits set in lane `i` where bit `i` of `bits` is, clear elsewhere: a blend's mask, two
+/// 64-bit splats (lanes 0 and 1, lanes 2 and 3) zipped.
+#[inline(always)]
+fn lane_mask(bits: i32) -> __m128 {
+    let half = |b: i32| (if b & 1 != 0 { 0xFFFF_FFFFu64 } else { 0 }) | (if b & 2 != 0 { 0xFFFF_FFFF_0000_0000 } else { 0 });
+    unsafe {
+        let lo: __m128 = vx::vx_splat(half(bits), 64);
+        let hi: __m128 = vx::vx_splat(half(bits >> 2), 64);
+        vx::vx_binary(lo, hi, 17, 64)
+    }
+}
 
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse3"))]
 pub fn _mm_moveldup_ps(a: __m128) -> __m128 {
-    __m128([a.0[0], a.0[0], a.0[2], a.0[2]])
+    // the even lanes twice: pshufd 2,2,0,0
+    unsafe { vx::vx_unary(a, 4, 32, 0xA0) }
 }
 
-/// Even lanes `a - b`, odd lanes `a + b`.
+/// Even lanes `a - b`, odd lanes `a + b`: `a + b` with the even lanes of `b` negated.
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse3"))]
 pub fn _mm_addsub_ps(a: __m128, b: __m128) -> __m128 {
-    __m128([a.0[0] - b.0[0], a.0[1] + b.0[1], a.0[2] - b.0[2], a.0[3] + b.0[3]])
+    _mm_add_ps(a, _mm_xor_ps(b, sign_even()))
 }
 
 /// Lane `i` from `b` where bit `i` of `IMM4` is set, else from `a`.
@@ -2299,24 +2328,15 @@ pub fn _mm_addsub_ps(a: __m128, b: __m128) -> __m128 {
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse4.1"))]
 #[rustc_legacy_const_generics(2)]
 pub fn _mm_blend_ps<const IMM4: i32>(a: __m128, b: __m128) -> __m128 {
-    let mut r = a.0;
-    let mut i = 0;
-    while i < 4 {
-        if IMM4 & (1 << i) != 0 {
-            r[i] = b.0[i];
-        }
-        i += 1;
-    }
-    __m128(r)
+    unsafe { vx::vx_blend(a, b, lane_mask(IMM4)) }
 }
 
-/// Lane `i` is `a[(IMM8 >> 2i) & 3]`.
+/// Lane `i` is `a[(IMM8 >> 2i) & 3]`: an i32 shuffle.
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
 #[rustc_legacy_const_generics(1)]
 pub fn _mm_permute_ps<const IMM8: i32>(a: __m128) -> __m128 {
-    let pick = |i: i32| a.0[((IMM8 >> (2 * i)) & 3) as usize];
-    __m128([pick(0), pick(1), pick(2), pick(3)])
+    unsafe { vx::vx_unary(a, 4, 32, IMM8 & 0xff) }
 }
 
 #[inline]
@@ -2329,34 +2349,27 @@ pub fn _mm_broadcast_ss(f: &f32) -> __m128 {
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "fma"))]
 pub fn _mm_fmaddsub_ps(a: __m128, b: __m128, c: __m128) -> __m128 {
-    unsafe {
-        let (add, sub) = (fma_ps(a, b, c, false, false), fma_ps(a, b, c, false, true));
-        __m128([sub.0[0], add.0[1], sub.0[2], add.0[3]])
-    }
+    // one fused a * b + c with the even lanes of c negated (a sign flip is exact)
+    unsafe { fma_ps(a, b, _mm_xor_ps(c, sign_even()), false, false) }
 }
 
 /// Even lanes `a * b + c`, odd lanes `a * b - c`, each rounded once.
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "fma"))]
 pub fn _mm_fmsubadd_ps(a: __m128, b: __m128, c: __m128) -> __m128 {
-    unsafe {
-        let (add, sub) = (fma_ps(a, b, c, false, false), fma_ps(a, b, c, false, true));
-        __m128([add.0[0], sub.0[1], add.0[2], sub.0[3]])
-    }
+    unsafe { fma_ps(a, b, _mm_xor_ps(c, sign_odd()), false, false) }
 }
 
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
 pub fn _mm256_moveldup_ps(a: __m256) -> __m256 {
-    let x = a.0;
-    __m256([x[0], x[0], x[2], x[2], x[4], x[4], x[6], x[6]])
+    unsafe { ps_join(_mm_moveldup_ps(ps_lo(&a)), _mm_moveldup_ps(ps_hi(&a))) }
 }
 
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
 pub fn _mm256_movehdup_ps(a: __m256) -> __m256 {
-    let x = a.0;
-    __m256([x[1], x[1], x[3], x[3], x[5], x[5], x[7], x[7]])
+    unsafe { ps_join(_mm_movehdup_ps(ps_lo(&a)), _mm_movehdup_ps(ps_hi(&a))) }
 }
 
 /// Lane `i` from `b` where bit `i` of `IMM8` is set, else from `a`.
@@ -2364,15 +2377,12 @@ pub fn _mm256_movehdup_ps(a: __m256) -> __m256 {
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
 #[rustc_legacy_const_generics(2)]
 pub fn _mm256_blend_ps<const IMM8: i32>(a: __m256, b: __m256) -> __m256 {
-    let mut r = a.0;
-    let mut i = 0;
-    while i < 8 {
-        if IMM8 & (1 << i) != 0 {
-            r[i] = b.0[i];
-        }
-        i += 1;
+    unsafe {
+        ps_join(
+            vx::vx_blend(ps_lo(&a), ps_lo(&b), lane_mask(IMM8)),
+            vx::vx_blend(ps_hi(&a), ps_hi(&b), lane_mask(IMM8 >> 4)),
+        )
     }
-    __m256(r)
 }
 
 /// `_mm_permute_ps` on each 128-bit half, with the same `IMM8`.

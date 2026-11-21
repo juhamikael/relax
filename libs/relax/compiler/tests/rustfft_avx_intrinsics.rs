@@ -1,4 +1,4 @@
-//! The SSE3, SSE4.1, AVX and FMA intrinsics rustfft 6.4's SSE and AVX paths call, lane by lane:
+//! The SSE3, SSE4.1, AVX and FMA intrinsics rustfft 6.4's SSE and AVX paths call:
 //! moveldup / movehdup, addsub, blend, permute, broadcast, the 128-to-256 casts, insertf128,
 //! fmaddsub / fmsubadd and loadu2_m128d. Under rustc these check the expectations against
 //! stdarch; under Relax they check its std against the same numbers.
