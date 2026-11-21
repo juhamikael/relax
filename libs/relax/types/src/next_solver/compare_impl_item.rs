@@ -122,6 +122,12 @@ impl Tcx {
             _ => unreachable!("compare_impl_item requires an associated item"),
         }
         ocx.evaluate_obligations_error_on_ambiguity()?;
+        // rustc_ty_utils/src/implied_bounds.rs: an impl item assumes its impl's header well-formed.
+        // `unsafe impl<S> ShardedListItem for Task<S>` (tokio) with `struct Task<S: 'static>` gets
+        // `S: 'static` from `Task<S>`; rustc also finds it in the trait signature's
+        // `<Task<S> as Link>::Target`, an alias argument, which implies nothing here.
+        if let Some(&self_ty) = self.impl_self.get(&imp) { if !wf_tys.contains(&self_ty) { wf_tys.push(self_ty); } }
+        if let Some(args) = self.impl_trait_args.get(&imp) { for &ty in args { if !wf_tys.contains(&ty) { wf_tys.push(ty); } } }
         if !infcx.resolve_regions(prog, env, &wf_tys).is_empty() { return Err(NoSolution); }
         if prog.def(method).kind == DefKind::AssocTy { self.check_type_bounds(prog, method, trait_method)?; }
         Ok(())
