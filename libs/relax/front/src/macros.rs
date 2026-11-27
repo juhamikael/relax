@@ -2532,10 +2532,19 @@ impl ImportLookup<'_> {
             }
         }
         if let Some(path) = self.binding(k, m, n, req) {
+            let (&last, prefix) = path.split_last()?;
             return match ns {
-                ImportNs::Module => self.path(k, m, &path, Some(i)).map(|(k, m)| ImportValue::Module(k, m)),
+                ImportNs::Module => {
+                    let leaf = names.str(last);
+                    let absolute = matches!(prefix, [root] if names.str(*root).is_empty());
+                    let extern_leaf = (prefix.is_empty() || absolute) && r.extern_crate(ks, leaf).is_some();
+                    if matches!(leaf, "crate" | "self" | "super") || leaf.starts_with("__relax_crate_") || extern_leaf {
+                        return self.path(k, m, &path, Some(i)).map(|(k, m)| ImportValue::Module(k, m));
+                    }
+                    let (tk, tm) = self.path(k, m, prefix, Some(i))?;
+                    self.ask(ns, tk, tm, last, next(tk), Some(i))
+                }
                 ImportNs::Macro => {
-                    let (&last, prefix) = path.split_last()?;
                     if prefix.is_empty() && req.is_some_and(|asker| within(asker, ms)) {
                         self.inputs.read(table, LookupInput::Definitions(last));
                         self.inputs.read(table, LookupInput::Prelude(k));
@@ -4611,6 +4620,31 @@ mod replay_tests {
         assert!(scope.lookup("value", "app", &["dep".into(), "dep".into()], "app::lib_rr").is_none());
         assert!(scope.lookup("missing", "app", &["crate".into(), "lib_rr".into()], "app").is_none());
         assert!(scope.finish().replays(&table, "app", "app.rs"));
+    }
+
+    #[test]
+    fn expanded_module_alias_checks_the_leaf_visibility() {
+        let mut table = macro_table();
+        let mut cm = CrateMods { root: "dep".into(), ..Default::default() };
+        let hidden = "dep::facade::hidden";
+        for (module, vis) in [("dep::facade", UseVis::Pub), (hidden, UseVis::Private)] {
+            cm.mods.insert(module.into());
+            cm.items.insert(module.into(), ModItem { vis, ..Default::default() });
+        }
+        for (leaf, vis) in [("restricted", UseVis::Crate), ("public", UseVis::Pub)] {
+            let module = format!("{hidden}::{leaf}");
+            cm.mods.insert(module.clone());
+            cm.items.insert(module.clone(), ModItem { vis, ..Default::default() });
+            cm.add_use(UseItem { module, path: vec!["crate".into(), "value".into()], bind: Some("value".into()), vis: UseVis::Pub });
+            table.add_exp_uses("dep", [(("dep::facade".into(), format!("{leaf}_alias")), vec!["self".into(), "hidden".into(), leaf.into()])]);
+        }
+        table.add_crate("dep".into(), std::sync::Arc::new(cm));
+        table.push(definition("dep", "one"));
+        let scope = MacroScope::new(std::sync::Arc::new(table));
+        let path = |root: &str, alias: &str| [root.into(), "facade".into(), alias.into()];
+        assert!(scope.lookup("value", "dep", &path("crate", "restricted_alias"), "dep").is_some(), "crate-visible leaf");
+        assert!(scope.lookup("value", "app", &path("dep", "public_alias"), "app").is_some(), "public leaf behind a private prefix");
+        assert!(scope.lookup("value", "app", &path("dep", "restricted_alias"), "app").is_none(), "crate-visible leaf from another crate");
     }
 
     #[test]
