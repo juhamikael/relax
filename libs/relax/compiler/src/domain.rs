@@ -1411,12 +1411,14 @@ fn teardown(id: DomainId) {
         unpublish(base);
     }
     let ranges = heap.as_ref().map(|heap| heap.ranges().collect::<Vec<_>>()).unwrap_or_default();
+    let mapped = heap.as_ref().map(|heap| heap.mapped_ranges()).unwrap_or_default();
     if let Some(heap) = heap.as_ref() {
-        for &(base, size) in &ranges {
+        for &(base, size) in ranges.iter().chain(&mapped) {
             crate::run_end::heap_goes(base..base + size);
             crate::inspect::heap::forget_range(base, size);
         }
         freed += (heap.stats().1 + heap.metadata_bytes()) as u64;
+        freed += mapped.iter().map(|&(_, size)| size as u64).sum::<u64>();
     }
     if base != 0 {
         crate::run_end::heap_goes(base as usize..base as usize + BLOCK_SIZE);
@@ -1429,7 +1431,7 @@ fn teardown(id: DomainId) {
         release(base);
     }
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    for (base, size) in ranges {
+    for (base, size) in ranges.into_iter().chain(mapped) {
         crate::run_end::leftovers::heap_gone(base, size);
     }
     drop((args, threads, crates));

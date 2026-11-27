@@ -1833,7 +1833,11 @@ mod routing_tests {
                 }
                 let partial = map(2 * PAGE);
                 register(&h1, partial + PAGE, PAGE);
-                assert!(!remap(removed(forget_map(partial, 2 * PAGE)), partial, 2 * PAGE, partial, PAGE, 0));
+                let taken = removed(forget_map(partial, 2 * PAGE));
+                assert!(taken.remap_destinations(partial, 2 * PAGE, dst, 3 * PAGE).eq([(dst + PAGE, 2 * PAGE)])
+                    && taken.remap_destinations(partial, 2 * PAGE, partial, PAGE).next().is_none(),
+                    "only the tracked tail grows at the destination, and shrinking past it leaves no PA coverage");
+                assert!(!remap(taken, partial, 2 * PAGE, partial, PAGE, 0));
                 assert!(h1.mapped_ranges().is_empty(), "the only PA fragment shrank away");
                 release(partial, PAGE);
 

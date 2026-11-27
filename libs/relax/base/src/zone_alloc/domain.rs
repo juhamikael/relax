@@ -171,6 +171,28 @@ impl TakenMaps {
         self.finish(|e| Some((e.range, e.join_left, e.join_right)));
     }
 
+    fn remap_entry(e: &TakenRange, old_addr: usize, old_len: usize, new_addr: usize, new_len: usize) -> Option<MapRange> {
+        let old_end = old_addr.checked_add(old_len)?;
+        let new_end = new_addr.checked_add(new_len)?;
+        let keep_end = old_addr.checked_add(old_len.min(new_len))?;
+        if e.range.addr < old_addr || e.range.addr >= keep_end || e.range.end > old_end { return None; }
+        let addr = new_addr.checked_add(e.range.addr - old_addr)?;
+        let end = if new_len > old_len && e.range.end == old_end {
+            new_end
+        } else {
+            new_addr.checked_add(e.range.end.min(keep_end) - old_addr)?
+        };
+        Some(MapRange { addr, end })
+    }
+
+    /// Destination bases and lengths that commit_remap will return to the captured heaps.
+    pub fn remap_destinations(&self, old_addr: usize, old_len: usize, new_addr: usize, new_len: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.slice().iter().filter_map(move |e| {
+            let r = Self::remap_entry(e, old_addr, old_len, new_addr, new_len)?;
+            Some((r.addr, r.end - r.addr))
+        })
+    }
+
     /// Commit a successful remap. Returns whether a tracked fragment survived at
     /// the destination. Only a fragment reaching the old end can own a grown tail.
     ///
@@ -178,17 +200,10 @@ impl TakenMaps {
     /// The page-aligned, non-overflowing ranges must describe the successful OS
     /// remap of the source taken or pinned by this token.
     pub unsafe fn commit_remap(mut self, old_addr: usize, old_len: usize, new_addr: usize, new_len: usize) -> bool {
-        let keep_end = old_addr + old_len.min(new_len);
         let in_place = old_addr == new_addr && !self.keep_old;
         self.finish(|e| {
-            if e.range.addr >= keep_end { return None; }
-            let addr = new_addr + (e.range.addr - old_addr);
-            let end = if new_len > old_len && e.range.end == old_addr + old_len {
-                new_addr + new_len
-            } else {
-                new_addr + (e.range.end.min(keep_end) - old_addr)
-            };
-            Some((MapRange { addr, end }, in_place && e.join_left, in_place && new_len == old_len && e.join_right))
+            let range = Self::remap_entry(e, old_addr, old_len, new_addr, new_len)?;
+            Some((range, in_place && e.join_left, in_place && new_len == old_len && e.join_right))
         })
     }
 
