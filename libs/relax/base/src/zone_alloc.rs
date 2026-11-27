@@ -1366,6 +1366,285 @@ mod routing_tests {
         }
     }
 
+    mod mapped_pages {
+        pub const PAGE: usize = 64 << 10;
+        pub const BUCKET: usize = 4 << 20;
+
+        #[cfg(unix)]
+        pub unsafe fn map(len: usize) -> usize {
+            use std::ffi::c_void;
+            extern "C" {
+                #[cfg_attr(all(target_os = "linux", target_pointer_width = "32"), link_name = "mmap64")]
+                fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+            }
+            #[cfg(target_vendor = "apple")]
+            const ANON: i32 = 0x1000;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            const ANON: i32 = 0x20;
+            let p = mmap(std::ptr::null_mut(), len, 3, 2 | ANON, -1, 0);
+            assert_ne!(p as isize, -1, "reserve test pages");
+            p as usize
+        }
+
+        #[cfg(unix)]
+        pub unsafe fn release(addr: usize, len: usize) {
+            extern "C" { fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32; }
+            assert_eq!(munmap(addr as *mut _, len), 0, "release test pages");
+        }
+
+        #[cfg(windows)]
+        pub unsafe fn map(len: usize) -> usize {
+            use relax_session::win32::*;
+            let p = VirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null(), "reserve test pages");
+            p as usize
+        }
+
+        #[cfg(windows)]
+        pub unsafe fn release(addr: usize, _: usize) {
+            use relax_session::win32::*;
+            assert_ne!(VirtualFree(addr as *mut u8, 0, MEM_RELEASE), 0, "release test reservation");
+        }
+
+        // Two independent reservations on opposite sides of an empty bitmap bucket.
+        #[cfg(unix)]
+        pub unsafe fn bracket() -> usize {
+            let raw = map(4 * BUCKET);
+            let aligned = raw.next_multiple_of(BUCKET);
+            if raw < aligned { release(raw, aligned - raw); }
+            release(aligned + BUCKET, BUCKET);
+            let tail = aligned + 3 * BUCKET;
+            release(tail, raw + 4 * BUCKET - tail);
+            aligned
+        }
+
+        #[cfg(windows)]
+        pub unsafe fn bracket() -> usize {
+            use relax_session::win32::*;
+            for _ in 0..8 {
+                let raw = VirtualAlloc(std::ptr::null_mut(), 4 * BUCKET, MEM_RESERVE, PAGE_READWRITE);
+                assert!(!raw.is_null(), "find an aligned window for the bitmap test");
+                let aligned = (raw as usize).next_multiple_of(BUCKET);
+                release(raw as usize, 4 * BUCKET);
+                let reserve = |addr| VirtualAlloc(addr as *mut u8, BUCKET, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                if reserve(aligned).is_null() { continue; }
+                if !reserve(aligned + 2 * BUCKET).is_null() { return aligned; }
+                release(aligned, BUCKET);
+            }
+            panic!("could not claim both aligned test reservations");
+        }
+
+        #[cfg(target_vendor = "apple")]
+        pub unsafe fn unmapped(addr: usize) -> bool {
+            extern "C" {
+                static mach_task_self_: u32;
+                fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut i32, count: *mut u32, object: *mut u32) -> i32;
+                fn mach_port_deallocate(task: u32, name: u32) -> i32;
+            }
+            const VM_REGION_BASIC_INFO_64: i32 = 9;
+            let (mut q, mut size, mut info, mut count, mut object) = (addr as u64, 0, [0i32; 16], 9, 0);
+            let result = mach_vm_region(mach_task_self_, &mut q, &mut size, VM_REGION_BASIC_INFO_64, info.as_mut_ptr(), &mut count, &mut object);
+            if object != 0 { mach_port_deallocate(mach_task_self_, object); }
+            result != 0 || q > addr as u64
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        pub unsafe fn unmapped(addr: usize) -> bool {
+            extern "C" { fn mincore(addr: *mut std::ffi::c_void, len: usize, vec: *mut u8) -> i32; }
+            let mut resident = 0;
+            mincore(addr as *mut _, 1, &mut resident) == -1 && std::io::Error::last_os_error().raw_os_error() == Some(12)
+        }
+
+        #[cfg(windows)]
+        pub unsafe fn unmapped(addr: usize) -> bool {
+            use relax_session::win32::{MemoryBasicInformation, VirtualQuery};
+            const MEM_FREE: u32 = 0x10000;
+            let mut info = std::mem::MaybeUninit::<MemoryBasicInformation>::uninit();
+            let len = std::mem::size_of::<MemoryBasicInformation>();
+            assert_eq!(VirtualQuery(addr as *const u8, info.as_mut_ptr(), len), len, "query test reservation");
+            info.assume_init().state == MEM_FREE
+        }
+    }
+
+    #[test]
+    fn program_allocator_mapped_ranges_split_spill_and_never_stale() {
+        use crate::memstat::Counting;
+        use domain::{
+            forget_map, forget_map_exact, heap_owns, map_candidate, map_state, record_map,
+            MapForget::{self, Removed}, MapRecord::{NotProgramAllocator, Recorded},
+        };
+        use mapped_pages::{bracket, map, release, unmapped, BUCKET, PAGE};
+        use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::Relaxed};
+
+        let _s = serial();
+        let _kept = kept();
+        struct Probe {
+            next: AtomicPtr<u8>,
+            frees: AtomicUsize,
+        }
+        unsafe extern "C" fn alloc(ctx: usize, size: usize, _: usize, zero: bool, out: *mut *mut u8) -> bool {
+            let p = (*(ctx as *const Probe)).next.swap(std::ptr::null_mut(), Relaxed);
+            if !p.is_null() && zero { p.write_bytes(0, size); }
+            out.write(p);
+            true
+        }
+        unsafe extern "C" fn dealloc(ctx: usize, _: *mut u8, _: usize, _: usize) -> bool {
+            (*(ctx as *const Probe)).frees.fetch_add(1, Relaxed);
+            true
+        }
+        unsafe extern "C" fn outside(_: usize, _: *mut u8, _: usize, _: usize) -> ! { std::process::abort() }
+        struct Restore(*const ());
+        impl Drop for Restore {
+            fn drop(&mut self) { unsafe { domain::restore(self.0); } }
+        }
+
+        domain::symbol(b"relax_alloc");
+        let pa = Probe { next: AtomicPtr::default(), frees: 0.into() };
+        let entries = domain::ProgramAllocator { ctx: std::ptr::from_ref(&pa) as usize, alloc, dealloc, outside };
+        unsafe {
+            let _outer = Restore(domain::current());
+            domain::restore(std::ptr::null());
+            let slab = map(PAGE);
+            assert_eq!(record_map(slab, PAGE), NotProgramAllocator, "outside a domain");
+            {
+                let plain = domain::DomainHeap::new(None, (0, 0)).unwrap();
+                let _leave = Restore(domain::current());
+                domain::enter(&*plain);
+                assert_eq!(record_map(slab, PAGE), NotProgramAllocator, "inside a heap without a PA");
+            }
+            let heap = domain::DomainHeap::new(Some(entries), (0, 0)).unwrap();
+            let leave = Restore(domain::current());
+            domain::enter(&*heap);
+            assert_eq!(record_map(slab, PAGE), Recorded);
+            assert_eq!(heap.mapped_ranges(), [(slab, PAGE)]);
+            let l = Layout::from_size_align(24, 8).unwrap();
+            let grown = Layout::from_size_align(48, 8).unwrap();
+            pa.next.store(slab as *mut u8, Relaxed);
+            let p = { let _run = relax_session::phase::run(); Counting.alloc(l) };
+            assert_eq!(p as usize, slab, "run allocation returns the PA block");
+            assert!(heap_owns(heap.as_ptr(), p) && domain::program_owns(p));
+            p.write_bytes(0xa3, l.size());
+            pa.next.store((slab + 64) as *mut u8, Relaxed);
+            let q = Counting.realloc(p, l, grown.size());
+            assert_eq!(q as usize, slab + 64, "same-thread resize uses the mapped PA");
+            assert!(all_eq(q, l.size(), 0xa3));
+            q.write_bytes(0x5a, grown.size());
+            pa.next.store((slab + 128) as *mut u8, Relaxed);
+            let addr = q as usize;
+            std::thread::spawn(move || {
+                let q = Counting.realloc(addr as *mut u8, grown, 96);
+                assert_eq!(q as usize, slab + 128, "foreign resize finds the mapping by address");
+                assert!(all_eq(q, grown.size(), 0x5a));
+                Counting.dealloc(q, Layout::from_size_align(96, 8).unwrap());
+            }).join().unwrap();
+            assert_eq!(pa.frees.load(Relaxed), 3, "both resize sources and the final block reached the PA");
+            assert_eq!(forget_map(slab, PAGE), Removed);
+            release(slab, PAGE);
+            assert!(!heap_owns(heap.as_ptr(), p) && domain::system_owned(p), "a released address has no PA owner");
+            // At 31 distinct mappings the first spill has one spare slot. Split twice:
+            // the second split must grow, even with no intervening mapping insertion.
+            let mut reservations = Vec::new();
+            for i in 0..31 {
+                let len = if i == 0 { 5 * PAGE } else { PAGE };
+                let addr = map(len);
+                assert_eq!(record_map(addr, len), Recorded);
+                reservations.push((addr, len));
+            }
+            let base = reservations[0].0;
+            reservations.sort_unstable();
+            assert_eq!(heap.mapped_ranges(), reservations, "all inline and spilled entries survive growth");
+            assert_eq!(forget_map(base + PAGE, PAGE), Removed);
+            let full = heap.mapped_ranges();
+            let state = map_state();
+            assert_eq!((full.len(), state.2), (32, 32));
+            let middle = base + 3 * PAGE;
+            domain::fail_next_map_grow();
+            assert_eq!(forget_map(middle, PAGE), MapForget::Failed);
+            assert_eq!(heap.mapped_ranges(), full, "failed split preserves every exact range");
+            assert_eq!(map_state(), state, "failed split preserves bounds and live count");
+            assert!(heap_owns(heap.as_ptr(), middle as *mut u8) && map_candidate(middle), "the failed split kept the middle page");
+            assert_eq!(forget_map(middle, PAGE), Removed, "retry grows and splits");
+            assert_eq!(heap.mapped_ranges().len(), 33);
+            assert!(!heap_owns(heap.as_ptr(), middle as *mut u8), "the successful retry removed the middle page");
+            for (addr, len) in reservations {
+                assert_eq!(forget_map(addr, len), Removed);
+                release(addr, len);
+                assert!(!heap_owns(heap.as_ptr(), addr as *mut u8));
+            }
+            assert_eq!(map_state(), (usize::MAX, 0, 0));
+
+            let a = bracket();
+            let b = a + 2 * BUCKET;
+            let mid = a + BUCKET;
+            assert_eq!(record_map(a, BUCKET), Recorded);
+            assert_eq!(record_map(b, BUCKET), Recorded);
+            let (low, high, live) = map_state();
+            assert!(low <= mid && mid < high && live == 2, "the gap lies inside the active mapping bounds");
+            assert!(map_candidate(a) && !map_candidate(mid) && map_candidate(b), "the bitmap rejects the empty bucket");
+            let system = Counting.alloc(l);
+            assert!(!system.is_null() && domain::system_owned(system));
+            let frees = pa.frees.load(Relaxed);
+            Counting.dealloc(system, l);
+            assert_eq!(pa.frees.load(Relaxed), frees, "a kept free of a system block bypasses the PA");
+
+            // Remove a span including a hole, trimming the tail of one range and front
+            // of another. Keep the reservations mapped until the bookkeeping checks finish.
+            assert_eq!(forget_map(mid - PAGE, BUCKET + 2 * PAGE), Removed);
+            assert_eq!(heap.mapped_ranges(), [(a, BUCKET - PAGE), (b + PAGE, BUCKET - PAGE)]);
+            assert_eq!(forget_map(mid - PAGE, BUCKET + 2 * PAGE), MapForget::NotTracked);
+            assert_eq!(forget_map(a + PAGE, PAGE), Removed);
+            for p in [a, a + 2 * PAGE] {
+                assert!(map_candidate(p) && heap_owns(heap.as_ptr(), p as *mut u8), "both fragments keep the shared bucket");
+            }
+            assert!(!heap_owns(heap.as_ptr(), (a + PAGE) as *mut u8));
+            // Recording over both fragments keeps one exact record and drops one live entry.
+            assert_eq!(record_map(a, BUCKET), Recorded);
+            assert_eq!(map_state().2, 2);
+            assert!(!forget_map_exact(a + PAGE), "an interior address is not a reservation base");
+            assert!(forget_map_exact(a));
+            assert!(!forget_map_exact(a));
+            assert_eq!(heap.mapped_ranges(), [(b + PAGE, BUCKET - PAGE)], "the other entry survives exact removal");
+            assert_eq!(forget_map(b, BUCKET), Removed);
+            release(a, BUCKET);
+            release(b, BUCKET);
+
+            let survivor = map(PAGE);
+            assert_eq!(record_map(survivor, PAGE), Recorded);
+            assert!(!unmapped(survivor));
+            drop(leave);
+            drop(heap);
+            assert!(unmapped(survivor), "the active heap released its survivor");
+            assert_eq!(map_state(), (usize::MAX, 0, 0));
+
+            let mixed = domain::DomainHeap::new(Some(entries), (0, 0)).unwrap();
+            let leave = Restore(domain::current());
+            domain::enter(&*mixed);
+            let first = map(PAGE);
+            let last = map(PAGE);
+            assert_eq!(record_map(first, PAGE), Recorded);
+            assert_eq!(record_map(last, PAGE), Recorded);
+            let system = Counting.alloc(l);
+            assert!(!system.is_null() && !domain::program_owns(system));
+            mixed.stop_routing();
+            mixed.stop_routing();
+            assert_eq!(map_state(), (usize::MAX, 0, 2), "stopping twice strips routing and retains both cleanup records");
+            assert!(domain::program_owns(system));
+            assert!(!map_candidate(first) && !heap_owns(mixed.as_ptr(), first as *mut u8));
+            Counting.dealloc(system, l);
+            let later = map(PAGE);
+            assert_eq!(record_map(later, PAGE), NotProgramAllocator);
+            release(later, PAGE);
+            assert_eq!(forget_map(first, PAGE), Removed);
+            release(first, PAGE);
+            assert_eq!(mixed.mapped_ranges(), [(last, PAGE)]);
+            assert!(!unmapped(last));
+            drop(leave);
+            drop(mixed);
+            assert!(unmapped(last), "the stopped heap released its survivor");
+            assert_eq!(map_state(), (usize::MAX, 0, 0));
+        }
+    }
+
     fn kept_guard_for_test() -> PhaseGuard {
         kept()
     }
