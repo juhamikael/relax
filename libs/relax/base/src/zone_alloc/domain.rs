@@ -6,6 +6,7 @@
 use super::compiler::{self, Arena};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -45,11 +46,12 @@ struct MapSet {
     heap: *mut MapRange,
     len: usize,
     cap: usize,
+    linked: bool,
 }
 
 impl MapSet {
     fn new() -> Self {
-        Self { inline: [MapRange { addr: 0, end: 0 }; INLINE_MAPS], heap: ptr::null_mut(), len: 0, cap: INLINE_MAPS }
+        Self { inline: [MapRange { addr: 0, end: 0 }; INLINE_MAPS], heap: ptr::null_mut(), len: 0, cap: INLINE_MAPS, linked: true }
     }
 
     fn slice(&self) -> &[MapRange] {
@@ -96,13 +98,137 @@ pub enum MapRecord {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+const INLINE_TAKEN: usize = 4;
+
+struct TakenRange {
+    heap: Arc<Heap>,
+    range: MapRange,
+    join_left: bool,
+    join_right: bool,
+}
+
+/// Clipped fragments, their original owners, and one reserved insertion slot per
+/// fragment. Dropping this token accepts the removal and releases the slots.
+pub struct TakenMaps {
+    inline: [MaybeUninit<TakenRange>; INLINE_TAKEN],
+    heap: *mut TakenRange,
+    len: usize,
+    cap: usize,
+    keep_old: bool,
+    reserved_held: bool,
+}
+
+// The spill is exclusively owned, and every initialized entry owns a Send heap lease.
+unsafe impl Send for TakenMaps {}
+
+impl std::fmt::Debug for TakenMaps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TakenMaps").field("len", &self.len).field("keep_old", &self.keep_old).finish()
+    }
+}
+
+impl TakenMaps {
+    fn empty(keep_old: bool) -> Self {
+        Self {
+            inline: [const { MaybeUninit::uninit() }; INLINE_TAKEN], heap: ptr::null_mut(),
+            len: 0, cap: INLINE_TAKEN, keep_old, reserved_held: false,
+        }
+    }
+
+    // Preflight allocates before we capture the first fragment. A retry may need
+    // a larger spill, but there are still no initialized entries to copy.
+    fn reserve_storage(&mut self, cap: usize) -> bool {
+        debug_assert_eq!(self.len, 0);
+        let data = alloc_map_storage::<TakenRange>(cap);
+        if data.is_null() { return false; }
+        unsafe { free_map_storage(self.heap, self.cap); }
+        self.heap = data;
+        self.cap = cap;
+        true
+    }
+
+    fn data_mut(&mut self) -> *mut TakenRange {
+        if self.heap.is_null() { self.inline.as_mut_ptr().cast() } else { self.heap }
+    }
+
+    fn slice(&self) -> &[TakenRange] {
+        let data = if self.heap.is_null() { self.inline.as_ptr().cast() } else { self.heap.cast_const() };
+        unsafe { std::slice::from_raw_parts(data, self.len) }
+    }
+
+    fn push(&mut self, entry: TakenRange) {
+        assert!(self.len < self.cap);
+        unsafe { self.data_mut().add(self.len).write(entry); }
+        self.len += 1;
+    }
+
+    /// Restore the clipped fragments to their owners after an OS operation failed.
+    ///
+    /// # Safety
+    /// Each removed fragment must still belong to its original live OS mapping.
+    pub unsafe fn restore(mut self) {
+        if self.keep_old { return; }
+        self.finish(|e| Some((e.range, e.join_left, e.join_right)));
+    }
+
+    /// Commit a successful remap. Returns whether a tracked fragment survived at
+    /// the destination. Only a fragment reaching the old end can own a grown tail.
+    ///
+    /// # Safety
+    /// The page-aligned, non-overflowing ranges must describe the successful OS
+    /// remap of the source taken or pinned by this token.
+    pub unsafe fn commit_remap(mut self, old_addr: usize, old_len: usize, new_addr: usize, new_len: usize) -> bool {
+        let keep_end = old_addr + old_len.min(new_len);
+        let in_place = old_addr == new_addr && !self.keep_old;
+        self.finish(|e| {
+            if e.range.addr >= keep_end { return None; }
+            let addr = new_addr + (e.range.addr - old_addr);
+            let end = if new_len > old_len && e.range.end == old_addr + old_len {
+                new_addr + new_len
+            } else {
+                new_addr + (e.range.end.min(keep_end) - old_addr)
+            };
+            Some((MapRange { addr, end }, in_place && e.join_left, in_place && new_len == old_len && e.join_right))
+        })
+    }
+
+    unsafe fn finish(&mut self, destination: impl Fn(&TakenRange) -> Option<(MapRange, bool, bool)>) -> bool {
+        let Some(_registry) = Registry::for_maps() else { return false };
+        let mut any = false;
+        let mut active_changed = false;
+        for e in self.slice() {
+            e.heap.maps_reserved.fetch_sub(1, Ordering::Release);
+            if let Some((range, left, right)) = destination(e) {
+                e.heap.restore_range(range, left, right);
+                active_changed |= e.heap.pa_active.load(Ordering::Relaxed);
+                any = true;
+            }
+        }
+        self.reserved_held = false;
+        if active_changed { recompute_map_bounds(HEAD.load(Ordering::Relaxed)); }
+        any
+    }
+}
+
+impl Drop for TakenMaps {
+    fn drop(&mut self) {
+        if self.reserved_held {
+            for e in self.slice() { e.heap.maps_reserved.fetch_sub(1, Ordering::Release); }
+        }
+        unsafe {
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.data_mut(), self.len));
+            free_map_storage(self.heap, self.cap);
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum MapForget {
     /// No overlap, or the registry was unavailable in a fork child.
     NotTracked,
-    /// All overlaps were removed, trimmed, or split.
-    Removed,
-    /// A split needed storage and none was available. All ranges are intact;
+    /// All overlaps were removed or pinned, with space to restore or move them.
+    Removed(TakenMaps),
+    /// Preflight could not allocate storage. All ranges are intact;
     /// the caller must withhold the OS operation and report ENOMEM.
     Failed,
 }
@@ -117,6 +243,8 @@ pub struct Heap {
     pa_active: AtomicBool,
     statics: (usize, usize),
     maps_len: AtomicUsize,
+    // Slots kept for operations that have yet to restore or move their mappings.
+    maps_reserved: AtomicUsize,
     maps: UnsafeCell<MapSet>,
     next: UnsafeCell<*mut Heap>,
 }
@@ -238,21 +366,25 @@ impl Drop for Registry {
     }
 }
 
-unsafe fn free_map_storage(data: *mut MapRange, cap: usize) {
+fn alloc_map_storage<T>(cap: usize) -> *mut T {
+    #[cfg(test)]
+    if FAIL_MAP_GROW.swap(false, Ordering::Relaxed) { return ptr::null_mut(); }
+    let Ok(layout) = Layout::array::<T>(cap) else { return ptr::null_mut() };
+    unsafe { System.alloc(layout).cast() }
+}
+
+unsafe fn free_map_storage<T>(data: *mut T, cap: usize) {
     if !data.is_null() {
-        System.dealloc(data.cast(), Layout::array::<MapRange>(cap).unwrap());
+        System.dealloc(data.cast(), Layout::array::<T>(cap).unwrap());
     }
 }
 
 /// The caller keeps the heap alive across the unlock. Allocate the replacement and
 /// free the discarded buffer (possibly our own, after a competing grow) outside the lock.
 fn reserve_map_storage(heap: &Heap, min_cap: usize) -> bool {
-    #[cfg(test)]
-    if FAIL_MAP_GROW.swap(false, Ordering::Relaxed) { return false; }
     let Some(cap) = min_cap.checked_next_power_of_two() else { return false };
-    let Ok(layout) = Layout::array::<MapRange>(cap) else { return false };
     unsafe {
-        let data = System.alloc(layout).cast::<MapRange>();
+        let data = alloc_map_storage::<MapRange>(cap);
         if data.is_null() { return false; }
         let Some(_registry) = Registry::for_maps() else {
             free_map_storage(data, cap);
@@ -279,6 +411,11 @@ pub(super) fn fail_next_map_grow() {
     FAIL_MAP_GROW.store(true, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+pub(super) fn take_fail_map_grow() -> bool {
+    FAIL_MAP_GROW.swap(false, Ordering::Relaxed)
+}
+
 /// The registry owns one Arc per linked heap. The guard pins both the links and
 /// the reference counts while we walk or take a lease.
 fn registered_heaps(_registry: &Registry) -> impl Iterator<Item = (*mut Heap, &Heap)> {
@@ -297,6 +434,27 @@ unsafe fn lease_heap(raw: *const Heap) -> Arc<Heap> {
 }
 
 impl Heap {
+    /// Spend at most one reserved slot. Only join an adjacent end that was cut
+    /// from this fragment; other adjacent reservations keep their distinct bases.
+    unsafe fn restore_range(&self, range: MapRange, join_left: bool, join_right: bool) {
+        let maps = &*self.maps.get();
+        let ranges = maps.slice();
+        let mut old = maps.overlaps(range);
+        if old.len() == 1 && ranges[old.start].addr <= range.addr && range.end <= ranges[old.start].end {
+            return;
+        }
+        let mut merged = range;
+        if join_left && old.start > 0 && ranges[old.start - 1].end == range.addr {
+            old.start -= 1;
+            merged.addr = ranges[old.start].addr;
+        }
+        if join_right && old.end < ranges.len() && ranges[old.end].addr == range.end {
+            merged.end = ranges[old.end].end;
+            old.end += 1;
+        }
+        self.splice_maps(merged, old, true);
+    }
+
     /// Replace the overlap with its surviving ends and, for an insert, the new map.
     /// The caller holds the registry and has reserved enough space for the splice.
     unsafe fn splice_maps(&self, range: MapRange, old: Range<usize>, insert: bool) {
@@ -325,6 +483,7 @@ impl Heap {
         let old_count = old.len();
         maps.splice(old, &new[..n]);
         self.maps_len.store(maps.len, Ordering::Release);
+        if !maps.linked { return; }
         if n > old_count {
             HEAP_MAPS_LIVE.fetch_add(n - old_count, Ordering::Release);
         } else if n < old_count {
@@ -352,7 +511,7 @@ pub unsafe fn record_map(addr: usize, len: usize) -> MapRecord {
     loop {
         if !heap.pa_active.load(Ordering::Relaxed) { return MapRecord::NotProgramAllocator; }
         let maps = &*heap.maps.get();
-        let needed = maps.len + 2;
+        let needed = maps.len + heap.maps_reserved.load(Ordering::Acquire) + 2;
         if needed <= maps.cap {
             heap.splice_maps(range, maps.overlaps(range), true);
             recompute_map_bounds(HEAD.load(Ordering::Relaxed));
@@ -365,64 +524,125 @@ pub unsafe fn record_map(addr: usize, len: usize) -> MapRecord {
     }
 }
 
-/// Remove overlaps before the OS releases or moves the pages. Preflight every
-/// heap before the first mutation so a failed split leaves all ownership intact.
+/// Remove overlaps before releasing or moving the pages. The token can restore
+/// every clipped fragment if the OS operation fails.
 pub fn forget_map(addr: usize, len: usize) -> MapForget {
-    let Some(end) = addr.checked_add(len) else { return MapForget::NotTracked };
-    if len == 0 || HEAP_MAPS_LIVE.load(Ordering::Acquire) == 0 { return MapForget::NotTracked; }
+    take_maps_inner(addr, len, false)
+}
+
+/// Pin the source of a remap that leaves its original mapping live.
+pub fn pin_maps(addr: usize, len: usize) -> MapForget {
+    take_maps_inner(addr, len, true)
+}
+
+fn take_maps_inner(addr: usize, len: usize, keep_old: bool) -> MapForget {
+    let mut taken = TakenMaps::empty(keep_old);
+    match change_maps(addr, len, Some(&mut taken)) {
+        Ok(true) => MapForget::Removed(taken),
+        Ok(false) => MapForget::NotTracked,
+        Err(()) => MapForget::Failed,
+    }
+}
+
+/// Discard overwritten ranges after a fixed mapping has committed. Only a split
+/// can need storage; a false result means that split could not be recorded.
+pub fn forget_map_discard(addr: usize, len: usize) -> bool {
+    change_maps(addr, len, None).is_ok()
+}
+
+/// Preflight the entire registry before capturing a lease or changing a range.
+/// Without a token no rollback slots are needed, even for a multi-heap discard.
+fn change_maps(addr: usize, len: usize, mut taken: Option<&mut TakenMaps>) -> Result<bool, ()> {
+    let Some(end) = addr.checked_add(len) else { return Ok(false) };
+    if len == 0 || HEAP_MAPS_LIVE.load(Ordering::Acquire) == 0 { return Ok(false); }
     let range = MapRange { addr, end };
+    let keep_old = taken.as_ref().is_some_and(|t| t.keep_old);
     loop {
-        let Some(registry) = Registry::for_maps() else { return MapForget::NotTracked };
+        let Some(registry) = Registry::for_maps() else { return Ok(false) };
         unsafe {
+            let mut total_frags = 0;
             let grow = registered_heaps(&registry).find_map(|(raw, heap)| {
                 let maps = &*heap.maps.get();
-                if maps.len == maps.cap {
-                    let ranges = maps.slice();
-                    let i = ranges.partition_point(|r| r.end <= addr);
-                    if ranges.get(i).is_some_and(|r| r.addr < addr && end < r.end) {
-                        return Some((lease_heap(raw), maps.cap + 1));
-                    }
-                }
-                None
+                let old = maps.overlaps(range);
+                if old.is_empty() { return None; }
+                total_frags += old.len();
+                let extra = if keep_old {
+                    old.len()
+                } else {
+                    let replaced = &maps.slice()[old];
+                    let ends = usize::from(replaced[0].addr < addr) + usize::from(replaced[replaced.len() - 1].end > end);
+                    // Capturing a removed entry reserves its vacated slot. A discard
+                    // needs extra space only to cut a hole strictly inside one entry.
+                    if taken.is_some() { ends } else { ends.saturating_sub(replaced.len()) }
+                };
+                let needed = maps.len + heap.maps_reserved.load(Ordering::Acquire) + extra;
+                (needed > maps.cap).then(|| (lease_heap(raw), needed))
             });
             if let Some((leased, needed)) = grow {
                 drop(registry);
-                if !reserve_map_storage(&leased, needed) { return MapForget::Failed; }
+                if !reserve_map_storage(&leased, needed) { return Err(()); }
                 continue;
             }
-            let mut removed = false;
-            let mut active_changed = false;
-            for (_, heap) in registered_heaps(&registry) {
-                let old = (*heap.maps.get()).overlaps(range);
-                if !old.is_empty() {
-                    heap.splice_maps(range, old, false);
-                    active_changed |= heap.pa_active.load(Ordering::Relaxed);
-                    removed = true;
+            if total_frags == 0 { return Ok(false); }
+            if let Some(buf) = taken.as_deref_mut() {
+                if total_frags > buf.cap {
+                    drop(registry);
+                    if !buf.reserve_storage(total_frags) { return Err(()); }
+                    continue;
                 }
             }
+            let mut active_changed = false;
+            for (raw, heap) in registered_heaps(&registry) {
+                let maps = &*heap.maps.get();
+                let old = maps.overlaps(range);
+                let m = old.len();
+                if m == 0 { continue; }
+                if let Some(buf) = taken.as_deref_mut() {
+                    for r in &maps.slice()[old.clone()] {
+                        buf.push(TakenRange {
+                            heap: lease_heap(raw),
+                            range: MapRange { addr: r.addr.max(addr), end: r.end.min(end) },
+                            join_left: !keep_old && r.addr < addr,
+                            join_right: !keep_old && r.end > end,
+                        });
+                    }
+                }
+                if !keep_old {
+                    heap.splice_maps(range, old, false);
+                    active_changed |= heap.pa_active.load(Ordering::Relaxed);
+                }
+                if taken.is_some() { heap.maps_reserved.fetch_add(m, Ordering::Relaxed); }
+            }
+            if let Some(buf) = taken { buf.reserved_held = true; }
             if active_changed { recompute_map_bounds(HEAD.load(Ordering::Relaxed)); }
-            return if removed { MapForget::Removed } else { MapForget::NotTracked };
+            return Ok(true);
         }
     }
 }
 
-/// Remove only the mapping starting at this reservation base, before releasing it.
-pub fn forget_map_exact(addr: usize) -> bool {
-    if HEAP_MAPS_LIVE.load(Ordering::Acquire) == 0 { return false; }
-    let Some(registry) = Registry::for_maps() else { return false };
+/// Remove a single reservation by base before releasing it. Its own slot is
+/// sufficient for rollback, and its lease fits inline.
+pub fn forget_map_exact(addr: usize) -> Option<TakenMaps> {
+    if HEAP_MAPS_LIVE.load(Ordering::Acquire) == 0 { return None; }
+    let registry = Registry::for_maps()?;
     unsafe {
-        for (_, heap) in registered_heaps(&registry) {
+        for (raw, heap) in registered_heaps(&registry) {
             let ranges = (*heap.maps.get()).slice();
             if let Ok(i) = ranges.binary_search_by_key(&addr, |r| r.addr) {
-                heap.splice_maps(ranges[i], i..i + 1, false);
+                let range = ranges[i];
+                let mut taken = TakenMaps::empty(false);
+                taken.push(TakenRange { heap: lease_heap(raw), range, join_left: false, join_right: false });
+                heap.splice_maps(range, i..i + 1, false);
+                heap.maps_reserved.fetch_add(1, Ordering::Relaxed);
+                taken.reserved_held = true;
                 if heap.pa_active.load(Ordering::Relaxed) {
                     recompute_map_bounds(HEAD.load(Ordering::Relaxed));
                 }
-                return true;
+                return Some(taken);
             }
         }
     }
-    false
+    None
 }
 
 impl DomainHeap {
@@ -442,6 +662,7 @@ impl DomainHeap {
                 pa_active: AtomicBool::new(program.is_some()),
                 statics,
                 maps_len: AtomicUsize::new(0),
+                maps_reserved: AtomicUsize::new(0),
                 maps: UnsafeCell::new(MapSet::new()),
                 next: UnsafeCell::new(std::ptr::null_mut()),
             }),
@@ -548,7 +769,9 @@ impl Drop for DomainHeap {
                     if std::ptr::eq(*link, Arc::as_ptr(&self.inner)) {
                         removed = Some(Arc::from_raw(*link));
                         *link = *self.inner.next.get();
-                        let ranges = (*self.inner.maps.get()).slice();
+                        let maps = &mut *self.inner.maps.get();
+                        maps.linked = false;
+                        let ranges = maps.slice();
                         if self.inner.pa_active.swap(false, Ordering::AcqRel) {
                             PA_HEAPS.fetch_sub(1, Ordering::Release);
                             for &r in ranges { map_filter_sub(r); }

@@ -1406,6 +1406,36 @@ mod routing_tests {
             assert_ne!(VirtualFree(addr as *mut u8, 0, MEM_RELEASE), 0, "release test reservation");
         }
 
+        // Adjacent ranges with independent release bases. On Windows another thread
+        // can claim part of the window between the probe release and a reservation.
+        pub unsafe fn consecutive(lengths: &[usize]) -> Vec<usize> {
+            let total = lengths.iter().sum();
+            #[cfg(unix)]
+            {
+                let mut next = map(total);
+                lengths.iter().map(|&len| { let addr = next; next += len; addr }).collect()
+            }
+            #[cfg(windows)]
+            {
+                use relax_session::win32::*;
+                for _ in 0..8 {
+                    let mut bases = Vec::with_capacity(lengths.len());
+                    let raw = VirtualAlloc(std::ptr::null_mut(), total, MEM_RESERVE, PAGE_READWRITE);
+                    assert!(!raw.is_null(), "find room for adjacent reservations");
+                    let mut next = raw as usize;
+                    release(next, total);
+                    for &len in lengths {
+                        if VirtualAlloc(next as *mut u8, len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).is_null() { break; }
+                        bases.push(next);
+                        next += len;
+                    }
+                    if bases.len() == lengths.len() { return bases; }
+                    for addr in bases { release(addr, 0); }
+                }
+                panic!("could not claim adjacent test reservations");
+            }
+        }
+
         // Two independent reservations on opposite sides of an empty bitmap bucket.
         #[cfg(unix)]
         pub unsafe fn bracket() -> usize {
@@ -1466,6 +1496,35 @@ mod routing_tests {
         }
     }
 
+    #[derive(Default)]
+    struct MappedProbe {
+        next: std::sync::atomic::AtomicPtr<u8>,
+        frees: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MappedProbe {
+        fn entries(&self) -> domain::ProgramAllocator {
+            use std::sync::atomic::Ordering::Relaxed;
+            unsafe extern "C" fn alloc(ctx: usize, size: usize, _: usize, zero: bool, out: *mut *mut u8) -> bool {
+                let p = (*(ctx as *const MappedProbe)).next.swap(std::ptr::null_mut(), Relaxed);
+                if !p.is_null() && zero { p.write_bytes(0, size); }
+                out.write(p);
+                true
+            }
+            unsafe extern "C" fn dealloc(ctx: usize, _: *mut u8, _: usize, _: usize) -> bool {
+                (*(ctx as *const MappedProbe)).frees.fetch_add(1, Relaxed);
+                true
+            }
+            unsafe extern "C" fn outside(_: usize, _: *mut u8, _: usize, _: usize) -> ! { std::process::abort() }
+            domain::ProgramAllocator { ctx: std::ptr::from_ref(self) as usize, alloc, dealloc, outside }
+        }
+    }
+
+    struct Restore(*const ());
+    impl Drop for Restore {
+        fn drop(&mut self) { unsafe { domain::restore(self.0); } }
+    }
+
     #[test]
     fn program_allocator_mapped_ranges_split_spill_and_never_stale() {
         use crate::memstat::Counting;
@@ -1474,33 +1533,13 @@ mod routing_tests {
             MapForget::{self, Removed}, MapRecord::{NotProgramAllocator, Recorded},
         };
         use mapped_pages::{bracket, map, release, unmapped, BUCKET, PAGE};
-        use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::Relaxed};
+        use std::sync::atomic::Ordering::Relaxed;
 
         let _s = serial();
         let _kept = kept();
-        struct Probe {
-            next: AtomicPtr<u8>,
-            frees: AtomicUsize,
-        }
-        unsafe extern "C" fn alloc(ctx: usize, size: usize, _: usize, zero: bool, out: *mut *mut u8) -> bool {
-            let p = (*(ctx as *const Probe)).next.swap(std::ptr::null_mut(), Relaxed);
-            if !p.is_null() && zero { p.write_bytes(0, size); }
-            out.write(p);
-            true
-        }
-        unsafe extern "C" fn dealloc(ctx: usize, _: *mut u8, _: usize, _: usize) -> bool {
-            (*(ctx as *const Probe)).frees.fetch_add(1, Relaxed);
-            true
-        }
-        unsafe extern "C" fn outside(_: usize, _: *mut u8, _: usize, _: usize) -> ! { std::process::abort() }
-        struct Restore(*const ());
-        impl Drop for Restore {
-            fn drop(&mut self) { unsafe { domain::restore(self.0); } }
-        }
-
         domain::symbol(b"relax_alloc");
-        let pa = Probe { next: AtomicPtr::default(), frees: 0.into() };
-        let entries = domain::ProgramAllocator { ctx: std::ptr::from_ref(&pa) as usize, alloc, dealloc, outside };
+        let pa = MappedProbe::default();
+        let entries = pa.entries();
         unsafe {
             let _outer = Restore(domain::current());
             domain::restore(std::ptr::null());
@@ -1538,13 +1577,13 @@ mod routing_tests {
                 Counting.dealloc(q, Layout::from_size_align(96, 8).unwrap());
             }).join().unwrap();
             assert_eq!(pa.frees.load(Relaxed), 3, "both resize sources and the final block reached the PA");
-            assert_eq!(forget_map(slab, PAGE), Removed);
+            assert!(matches!(forget_map(slab, PAGE), Removed(_)));
             release(slab, PAGE);
             assert!(!heap_owns(heap.as_ptr(), p) && domain::system_owned(p), "a released address has no PA owner");
-            // At 31 distinct mappings the first spill has one spare slot. Split twice:
-            // the second split must grow, even with no intervening mapping insertion.
+            // The first split at 30 entries uses a slot for the survivor and one for rollback.
+            // The second split must grow even after the first token releases its reservation.
             let mut reservations = Vec::new();
-            for i in 0..31 {
+            for i in 0..30 {
                 let len = if i == 0 { 5 * PAGE } else { PAGE };
                 let addr = map(len);
                 assert_eq!(record_map(addr, len), Recorded);
@@ -1553,21 +1592,21 @@ mod routing_tests {
             let base = reservations[0].0;
             reservations.sort_unstable();
             assert_eq!(heap.mapped_ranges(), reservations, "all inline and spilled entries survive growth");
-            assert_eq!(forget_map(base + PAGE, PAGE), Removed);
+            assert!(matches!(forget_map(base + PAGE, PAGE), Removed(_)));
             let full = heap.mapped_ranges();
             let state = map_state();
-            assert_eq!((full.len(), state.2), (32, 32));
+            assert_eq!((full.len(), state.2), (31, 31));
             let middle = base + 3 * PAGE;
             domain::fail_next_map_grow();
-            assert_eq!(forget_map(middle, PAGE), MapForget::Failed);
+            assert!(matches!(forget_map(middle, PAGE), MapForget::Failed));
             assert_eq!(heap.mapped_ranges(), full, "failed split preserves every exact range");
             assert_eq!(map_state(), state, "failed split preserves bounds and live count");
             assert!(heap_owns(heap.as_ptr(), middle as *mut u8) && map_candidate(middle), "the failed split kept the middle page");
-            assert_eq!(forget_map(middle, PAGE), Removed, "retry grows and splits");
-            assert_eq!(heap.mapped_ranges().len(), 33);
+            assert!(matches!(forget_map(middle, PAGE), Removed(_)), "retry grows and splits");
+            assert_eq!(heap.mapped_ranges().len(), 32);
             assert!(!heap_owns(heap.as_ptr(), middle as *mut u8), "the successful retry removed the middle page");
             for (addr, len) in reservations {
-                assert_eq!(forget_map(addr, len), Removed);
+                assert!(matches!(forget_map(addr, len), Removed(_)));
                 release(addr, len);
                 assert!(!heap_owns(heap.as_ptr(), addr as *mut u8));
             }
@@ -1589,10 +1628,10 @@ mod routing_tests {
 
             // Remove a span including a hole, trimming the tail of one range and front
             // of another. Keep the reservations mapped until the bookkeeping checks finish.
-            assert_eq!(forget_map(mid - PAGE, BUCKET + 2 * PAGE), Removed);
+            assert!(matches!(forget_map(mid - PAGE, BUCKET + 2 * PAGE), Removed(_)));
             assert_eq!(heap.mapped_ranges(), [(a, BUCKET - PAGE), (b + PAGE, BUCKET - PAGE)]);
-            assert_eq!(forget_map(mid - PAGE, BUCKET + 2 * PAGE), MapForget::NotTracked);
-            assert_eq!(forget_map(a + PAGE, PAGE), Removed);
+            assert!(matches!(forget_map(mid - PAGE, BUCKET + 2 * PAGE), MapForget::NotTracked));
+            assert!(matches!(forget_map(a + PAGE, PAGE), Removed(_)));
             for p in [a, a + 2 * PAGE] {
                 assert!(map_candidate(p) && heap_owns(heap.as_ptr(), p as *mut u8), "both fragments keep the shared bucket");
             }
@@ -1600,11 +1639,11 @@ mod routing_tests {
             // Recording over both fragments keeps one exact record and drops one live entry.
             assert_eq!(record_map(a, BUCKET), Recorded);
             assert_eq!(map_state().2, 2);
-            assert!(!forget_map_exact(a + PAGE), "an interior address is not a reservation base");
-            assert!(forget_map_exact(a));
-            assert!(!forget_map_exact(a));
+            assert!(forget_map_exact(a + PAGE).is_none(), "an interior address is not a reservation base");
+            assert!(forget_map_exact(a).is_some());
+            assert!(forget_map_exact(a).is_none());
             assert_eq!(heap.mapped_ranges(), [(b + PAGE, BUCKET - PAGE)], "the other entry survives exact removal");
-            assert_eq!(forget_map(b, BUCKET), Removed);
+            assert!(matches!(forget_map(b, BUCKET), Removed(_)));
             release(a, BUCKET);
             release(b, BUCKET);
 
@@ -1634,7 +1673,7 @@ mod routing_tests {
             let later = map(PAGE);
             assert_eq!(record_map(later, PAGE), NotProgramAllocator);
             release(later, PAGE);
-            assert_eq!(forget_map(first, PAGE), Removed);
+            assert!(matches!(forget_map(first, PAGE), Removed(_)));
             release(first, PAGE);
             assert_eq!(mixed.mapped_ranges(), [(last, PAGE)]);
             assert!(!unmapped(last));
@@ -1642,6 +1681,193 @@ mod routing_tests {
             drop(mixed);
             assert!(unmapped(last), "the stopped heap released its survivor");
             assert_eq!(map_state(), (usize::MAX, 0, 0));
+        }
+    }
+
+    #[test]
+    fn taken_maps_restore_and_commit_remap_preserve_ownership() {
+        use domain::{
+            fail_next_map_grow, forget_map, forget_map_discard, forget_map_exact, heap_owns,
+            map_candidate, map_state, pin_maps, take_fail_map_grow, DomainHeap, MapForget, TakenMaps,
+        };
+        use mapped_pages::{consecutive, map, release, unmapped, PAGE};
+        use std::time::{Duration, Instant};
+
+        fn removed(result: MapForget) -> TakenMaps {
+            match result {
+                MapForget::Removed(t) => t,
+                other => panic!("expected a mapping token, got {other:?}"),
+            }
+        }
+        unsafe fn register(heap: &DomainHeap, addr: usize, len: usize) {
+            let _leave = Restore(domain::current());
+            domain::enter(heap);
+            assert_eq!(domain::record_map(addr, len), domain::MapRecord::Recorded);
+        }
+
+        let _s = serial();
+        let _kept = kept();
+        domain::symbol(b"relax_alloc");
+        let pa = MappedProbe::default();
+        unsafe {
+            let _outer = Restore(domain::current());
+            domain::restore(std::ptr::null());
+            let h1 = DomainHeap::new(Some(pa.entries()), (0, 0)).unwrap();
+            let base = map(5 * PAGE);
+            register(&h1, base, 5 * PAGE);
+            for _ in 0..13 { register(&h1, map(PAGE), PAGE); }
+            let original = h1.mapped_ranges();
+            let state = map_state();
+            let hole = base + 3 * PAGE;
+            // A failed DONTUNMAP operation keeps the source and gives back its slot.
+            removed(pin_maps(base, PAGE)).restore();
+            fail_next_map_grow();
+            let taken = std::thread::spawn(move || removed(forget_map(hole, PAGE))).join().unwrap();
+            assert!(take_fail_map_grow(), "the pin released its slot before the split");
+            assert_eq!(map_state().2, 15);
+            assert!(!heap_owns(h1.as_ptr(), hole as *mut u8));
+            let split = h1.mapped_ranges();
+            fail_next_map_grow();
+            assert!(!forget_map_discard(base + PAGE, PAGE), "a discard cannot spend the rollback slot");
+            assert_eq!(h1.mapped_ranges(), split, "failed discard kept both ends");
+            fail_next_map_grow();
+            taken.restore();
+            assert!(take_fail_map_grow(), "restore allocated at full capacity");
+            assert_eq!(h1.mapped_ranges(), original, "restore rejoined both ends");
+            assert_eq!(map_state(), state);
+            assert!(heap_owns(h1.as_ptr(), hole as *mut u8) && map_candidate(hole));
+            for (a, len) in original {
+                assert!(forget_map_discard(a, len));
+                release(a, len);
+            }
+
+            let h2 = DomainHeap::new(Some(pa.entries()), (0, 0)).unwrap();
+            let h3 = DomainHeap::new(Some(pa.entries()), (0, 0)).unwrap();
+            let sizes = [2 * PAGE, PAGE, PAGE, PAGE, 2 * PAGE, PAGE];
+            let a = consecutive(&sizes);
+            register(&h1, a[0], sizes[0]);
+            register(&h1, a[1], sizes[1]);
+            register(&h2, a[3], sizes[3]);
+            register(&h3, a[4], sizes[4]);
+            h3.stop_routing();
+            let snapshots = || [h1.mapped_ranges(), h2.mapped_ranges(), h3.mapped_ranges()];
+            let before = snapshots();
+            let state = map_state();
+            {
+                let _leave = Restore(domain::current());
+                domain::enter(&*h2);
+                let taken = removed(forget_map(a[0] + PAGE, a[4] - a[0]));
+                assert_eq!(snapshots(), [vec![(a[0], PAGE)], vec![], vec![(a[4] + PAGE, PAGE)]]);
+                taken.restore();
+            }
+            assert_eq!(snapshots(), before, "exact original heaps, clipped ends, and adjacent bases");
+            assert_eq!(map_state(), state);
+            assert!(domain::system_owned(a[2] as *mut u8), "the gap has no PA owner");
+            assert!(!map_candidate(a[4]) && state.1 == a[4], "the stopped heap stays outside the filter bounds");
+            let taken = forget_map_exact(a[1]).unwrap();
+            assert_eq!(h1.mapped_ranges(), [(a[0], sizes[0])]);
+            fail_next_map_grow();
+            taken.restore();
+            assert!(take_fail_map_grow(), "exact rollback allocated");
+            assert_eq!(snapshots(), before);
+
+            let span = a[5] + sizes[5] - a[0];
+            assert!(forget_map_discard(a[0], span));
+            for (i, &len) in sizes.iter().enumerate() {
+                register(if i % 2 == 0 { &h1 } else { &h2 }, a[i], len);
+            }
+            let before = snapshots();
+            let state = map_state();
+            fail_next_map_grow();
+            assert!(matches!(forget_map(a[0], span), MapForget::Failed), "six fragments need a token spill");
+            assert_eq!(snapshots(), before, "spill OOM leaves every heap intact");
+            assert_eq!(map_state(), state);
+            let taken = removed(forget_map(a[0], span));
+            assert_eq!(map_state(), (usize::MAX, 0, 0));
+            taken.restore();
+            assert_eq!(snapshots(), before, "spilled entries retain their individual owners");
+            assert_eq!(map_state(), state);
+            assert!(forget_map_discard(a[0], span));
+            for (&addr, &len) in a.iter().zip(&sizes) { release(addr, len); }
+
+            // This consumer is the Linux/Android mremap interposer. Exercise actual
+            // moves and shrinks so every committed fragment has its OS backing.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                use std::ffi::c_void;
+                extern "C" { fn mremap(old: *mut c_void, old_len: usize, new_len: usize, flags: i32, ...) -> *mut c_void; }
+                const MAYMOVE: i32 = 1;
+                const FIXED: i32 = 2;
+                const DONTUNMAP: i32 = 4;
+                let remap = |t: TakenMaps, old: usize, len: usize, dst: usize, size: usize, flags: i32| {
+                    let p = mremap(old as *mut _, len, size, flags, dst as *mut c_void);
+                    if p as isize == -1 {
+                        let error = std::io::Error::last_os_error();
+                        t.restore();
+                        panic!("remap test pages: {error}");
+                    }
+                    assert_eq!(p as usize, dst);
+                    t.commit_remap(old, len, dst, size)
+                };
+                let old = map(PAGE);
+                register(&h1, old, PAGE);
+                let dst = map(2 * PAGE);
+                std::thread::spawn(move || {
+                    let t = removed(forget_map(old, PAGE));
+                    fail_next_map_grow();
+                    assert!(remap(t, old, PAGE, dst, 2 * PAGE, MAYMOVE | FIXED));
+                    assert!(take_fail_map_grow(), "move and grow allocated after the syscall");
+                }).join().unwrap();
+                assert_eq!(h1.mapped_ranges(), [(dst, 2 * PAGE)]);
+                assert!(!heap_owns(h1.as_ptr(), old as *mut u8) && heap_owns(h1.as_ptr(), (dst + PAGE) as *mut u8));
+                assert!(remap(removed(forget_map(dst, 2 * PAGE)), dst, 2 * PAGE, dst, PAGE, 0));
+                assert_eq!(h1.mapped_ranges(), [(dst, PAGE)], "in-place shrink released the tail");
+                let copy = map(PAGE);
+                assert!(remap(removed(pin_maps(dst, PAGE)), dst, PAGE, copy, PAGE, MAYMOVE | FIXED | DONTUNMAP));
+                let mut both = [(dst, PAGE), (copy, PAGE)];
+                both.sort_unstable();
+                assert_eq!(h1.mapped_ranges(), both, "a pinned source and its destination keep the same owner");
+                for (addr, len) in both {
+                    assert!(forget_map_exact(addr).is_some());
+                    release(addr, len);
+                }
+                let partial = map(2 * PAGE);
+                register(&h1, partial + PAGE, PAGE);
+                assert!(!remap(removed(forget_map(partial, 2 * PAGE)), partial, 2 * PAGE, partial, PAGE, 0));
+                assert!(h1.mapped_ranges().is_empty(), "the only PA fragment shrank away");
+                release(partial, PAGE);
+
+                let old = map(PAGE);
+                register(&h2, old, PAGE);
+                h2.stop_routing();
+                let dst = map(PAGE);
+                assert!(remap(removed(forget_map(old, PAGE)), old, PAGE, dst, PAGE, MAYMOVE | FIXED));
+                assert_eq!(h2.mapped_ranges(), [(dst, PAGE)], "a stopped owner still takes its moved mapping");
+                assert_eq!(map_state(), (usize::MAX, 0, 1));
+                assert!(!map_candidate(dst));
+                drop(h2);
+                assert!(unmapped(dst));
+            }
+
+            let baseline = map_state();
+            let h_drop = DomainHeap::new(Some(pa.entries()), (0, 0)).unwrap();
+            let (p1, p2) = (map(PAGE), map(PAGE));
+            register(&h_drop, p1, PAGE);
+            register(&h_drop, p2, PAGE);
+            let taken = removed(forget_map(p1, PAGE));
+            assert_eq!(map_state().2, baseline.2 + 1);
+            let thread = std::thread::spawn(move || drop(h_drop));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while map_state().2 != baseline.2 {
+                assert!(Instant::now() < deadline, "heap drop did not unlink before draining its leases");
+                std::thread::yield_now();
+            }
+            assert!(!unmapped(p1) && !unmapped(p2), "the token keeps the unlinked heap alive");
+            taken.restore();
+            assert_eq!(map_state(), baseline, "restoring to an unlinked heap leaves global ownership alone");
+            thread.join().unwrap();
+            assert!(unmapped(p1) && unmapped(p2), "heap drop released the survivor and restored page");
+            assert_eq!(map_state(), baseline);
         }
     }
 
