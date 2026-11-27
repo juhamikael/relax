@@ -229,6 +229,7 @@ pub fn jit(cmd: &str, sub: &str) -> Option<&'static str> {
 
 /// Structural design operations, selected before queuing a UI edit.
 pub const DESIGN: &[(&str, &str)] = &[
+    ("tree", r#""w":{"type":"integer"},"window":{"type":"integer"},"path":{"type":"string"},"reveal":{"type":"string"},"query":{"type":"string"},"depth":{"type":"integer"},"offset":{"type":"integer"},"limit":{"type":"integer"}"#),
     ("pick", r#""w":{"type":"integer"},"at":{"type":"string"},"path":{"type":"string"},"window":{"type":"integer"}"#),
     ("props", r#""w":{"type":"integer"},"path":{"type":"string"}"#),
     ("locate", r#""w":{"type":"integer"},"path":{"type":"string"}"#),
