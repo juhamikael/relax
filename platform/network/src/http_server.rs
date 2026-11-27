@@ -291,16 +291,20 @@ pub enum HttpServerRequest {
 pub struct HttpServerThread {
     thread: std::thread::JoinHandle<()>,
     stop: Arc<AtomicBool>,
-    /// where a connection wakes the accept loop that is blocked in `accept`
-    wake: SocketAddr,
+    bound: SocketAddr,
 }
 
 impl HttpServerThread {
+    /// The listener's bound address, including the port assigned when binding to port zero.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.bound
+    }
+
     /// Ends the accept loop: sets the stop flag and wakes `accept` with a connection of its own,
     /// which the loop drops unanswered. Returns at once; [`HttpServerThread::join`] waits.
     pub fn stop(&self) {
         if !self.stop.swap(true, Ordering::AcqRel) {
-            let _ = TcpStream::connect(self.wake);
+            let _ = TcpStream::connect(dial_addr(self.bound));
         }
     }
 
@@ -320,7 +324,7 @@ pub fn start_http_server(http_server: HttpServer) -> Option<HttpServerThread> {
         println!("Cannot bind http server port");
         return None;
     };
-    let wake = dial_addr(listener.local_addr().ok()?);
+    let bound = listener.local_addr().ok()?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
 
@@ -489,7 +493,7 @@ pub fn start_http_server(http_server: HttpServer) -> Option<HttpServerThread> {
             }
         })
     };
-    Some(HttpServerThread { thread: listen_thread, stop, wake })
+    Some(HttpServerThread { thread: listen_thread, stop, bound })
 }
 
 fn handle_post(
@@ -904,6 +908,40 @@ fn write_bytes_until(tcp_stream: &mut TcpStream, bytes: &[u8], deadline: Instant
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn http_server_local_addr_reports_ephemeral_port() {
+        let (request, requests) = mpsc::channel();
+        let server = start_http_server(HttpServer {
+            listen_address: "127.0.0.1:0".parse().unwrap(),
+            request,
+            post_max_size: 0,
+            post_max_size_overrides: Vec::new(),
+            pre_admit_posts: false,
+            client_ip_resolver: None,
+            trusted_proxy: None,
+            allowed_methods: None,
+        }).unwrap();
+        let address = server.local_addr();
+        assert!(address.ip().is_loopback());
+        assert_ne!(address.port(), 0, "listener did not report the assigned port");
+        let limit = Duration::from_millis(750);
+        let mut client = TcpStream::connect_timeout(&address, limit).unwrap();
+        client.set_read_timeout(Some(limit)).unwrap();
+        client.write_all(b"GET /port HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let incoming = requests.recv_timeout(limit);
+        server.stop();
+        server.join().unwrap();
+        let HttpServerRequest::Get { headers, response_sender } = incoming.unwrap() else {
+            panic!("expected GET on the reported port");
+        };
+        assert_eq!(headers.path, "/port");
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+        response_sender.send(HttpServerResponse::new(header.into(), b"ok".to_vec())).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(response, format!("{header}ok"));
+    }
 
     #[test]
     fn aggregate_body_budget_is_bounded_and_released() {
