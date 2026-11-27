@@ -81,6 +81,16 @@ fn launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64) -> (Dom
 fn try_launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64, probe: bool)
     -> Result<(DomainId, u64, std::thread::JoinHandle<()>), Vec<String>>
 {
+    let routing = if probe { FixtureRouting::Probed } else { FixtureRouting::Unprobed };
+    launch_with_routing(u, entry, id, arg, routing)
+}
+
+#[derive(PartialEq, Eq)]
+enum FixtureRouting { Probed, Unprobed, Disabled }
+
+fn launch_with_routing(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64, routing: FixtureRouting)
+    -> Result<(DomainId, u64, std::thread::JoinHandle<()>), Vec<String>>
+{
     let id = prepare(&AppSpec {
         package: "teardown-fixture".into(),
         id,
@@ -93,8 +103,10 @@ fn try_launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64, pro
     // A fixture's #[global_allocator] becomes its domain's PA with no provided crate bound (the
     // test sets the root crate after fixture_of, so Unit::new could not see it): its shims check,
     // as a routing program's do, before the program's code is made.
+    let allocator = allocator.filter(|_| routing != FixtureRouting::Disabled);
     u.routes_allocator = allocator.is_some();
     let heap = ProgramHeap::new(base, allocator).unwrap();
+    let probe = routing == FixtureRouting::Probed;
     if probe {
         // The makepad run host installs its program unit before starting an app domain.
         unsafe { crate::jit::set_runtime_unit(u); }
@@ -1673,6 +1685,191 @@ fn jit_frees_a_counted_loader_buffer() {
     assert_eq!(flags[2].load(Ordering::SeqCst), 0, "freeing a loader buffer did not call the header allocator's dealloc");
     assert_eq!(AFTER.load(Ordering::Relaxed), BEFORE.load(Ordering::Relaxed), "JIT dealloc returns counted live bytes to their pre-op total");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_op_callback_sink_safe_across_all_classes_and_memstat() {
+    const CHILD: &str = "RELAX_TEST_CALLBACK_SINK_REPORT";
+    let Ok(report) = std::env::var(CHILD) else {
+        let test = "domain::teardown_tests::host_op_callback_sink_safe_across_all_classes_and_memstat";
+        let check = |report: &str| {
+            let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"]).env(CHILD, report).env("RELAX_MEM_REPORT", report));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && stdout.contains("test result: ok. 1 passed"),
+                "all four callback sink launches must pass with accounting={report}: {stdout}{stderr}");
+            let events: Vec<_> = stderr.lines().filter_map(|line| {
+                if line.contains("for a 4194304-byte probe, outside the memory its domain owns") { Some("probe refused") }
+                else { line.strip_prefix("callback sink launch: ") }
+            }).collect();
+            assert_eq!(events, ["registered", "done", "refused", "probe refused", "done", "unrouted", "done", "default", "done"],
+                "only the outside-mapping launch refuses the large probe, accounting={report}: {stderr}");
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| check("0"));
+            check("1");
+        });
+        return;
+    };
+    assert_eq!(crate::memstat::enabled(), report == "1",
+        "the child started with the requested accounting mode");
+
+    type Write = unsafe extern "C-unwind" fn(*mut u8, *const u8, usize);
+    static ROUTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static MAP_LARGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static FIRST_FAILURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    extern "C" fn fail(check: u32) {
+        let _ = FIRST_FAILURE.compare_exchange(0, check, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    extern "C" fn map_large() -> bool { MAP_LARGE.load(Ordering::Relaxed) }
+    unsafe extern "C-unwind" fn emit(len: usize, ctx: *mut u8, write: Write) {
+        let _host = crate::zone_alloc::kept();
+        let mut bytes = vec![0x35; len];
+        bytes[len - 1] = 0xb7;
+        // A registered PA rejects the loader's address. With routing off the shim accepts all addresses.
+        assert_eq!(!crate::zone_alloc::domain::program_owns(bytes.as_mut_ptr()), ROUTED.load(Ordering::Relaxed),
+            "the host buffer sees the allocator routing selected for this launch");
+        write(ctx, bytes.as_ptr(), len);
+    }
+    extern "C" fn live() -> i64 { crate::memstat::live_total() }
+    extern "C" {
+        fn malloc(size: usize) -> *mut core::ffi::c_void;
+        fn free(p: *mut core::ffi::c_void);
+    }
+
+    let source = r#"
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+        static FREES: AtomicUsize = AtomicUsize::new(0);
+
+        type Write = unsafe extern "C-unwind" fn(*mut u8, *const u8, usize);
+        type Emit = unsafe extern "C-unwind" fn(usize, *mut u8, Write);
+        type Fail = extern "C" fn(u32);
+        unsafe extern "C-unwind" fn write(ctx: *mut u8, ptr: *const u8, len: usize) {
+            let (out, fail) = &mut *ctx.cast::<(Vec<u8>, Fail)>();
+            let copy = std::slice::from_raw_parts(ptr, len).to_vec();
+            if copy.as_ptr() == ptr {
+                std::mem::forget(copy); // The host still owns this allocation.
+                return fail(1);
+            }
+            *out = copy;
+        }
+        fn round_trip(emit: Emit, len: usize, has_pa: bool, fail: Fail) {
+            let allocs = ALLOCS.load(Ordering::Relaxed);
+            let frees = FREES.load(Ordering::Relaxed);
+            let mut sink = (Vec::<u8>::new(), fail);
+            unsafe { emit(len, (&mut sink as *mut (Vec<u8>, Fail)).cast(), write); }
+            let mut bytes = sink.0;
+            if bytes.len() != len { return fail(2); }
+            let capacity = bytes.capacity();
+            bytes.reserve_exact(capacity - len + 1);
+            bytes.push(0xe1);
+            if bytes.capacity() <= capacity { return fail(3); }
+            if bytes.len() <= len || bytes[0] != 0x35 || bytes[len - 1] != 0xb7 || bytes[len] != 0xe1 {
+                return fail(4);
+            }
+            drop(bytes);
+            let expected = if has_pa { 2 } else { 0 };
+            if ALLOCS.load(Ordering::Relaxed) != allocs.wrapping_add(expected) { return fail(5); }
+            if FREES.load(Ordering::Relaxed) != frees.wrapping_add(expected) { return fail(6); }
+        }
+        fn fixture(api: *const [usize; 4]) {
+            let [emit, live, has_pa, fail] = unsafe { *api };
+            let emit: Emit = unsafe { std::mem::transmute(emit) };
+            let live: extern "C" fn() -> i64 = unsafe { std::mem::transmute(live) };
+            let fail: Fail = unsafe { std::mem::transmute(fail) };
+            for len in [73, 4 << 20] {
+                round_trip(emit, len, has_pa != 0, fail);
+                let before = live();
+                round_trip(emit, len, has_pa != 0, fail);
+                if live() != before { return fail(7); }
+            }
+        }
+    "#;
+    let allocator = r#"
+        use std::alloc::{GlobalAlloc, Layout, System};
+        #[global_allocator]
+        static PA: HeaderAllocator = HeaderAllocator;
+        struct HeaderAllocator;
+        unsafe fn outside(size: usize) -> bool {
+            let map_large: extern "C" fn() -> bool = std::mem::transmute(MAP_FNusize);
+            size >= 4 << 20 && map_large()
+        }
+        unsafe impl GlobalAlloc for HeaderAllocator {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                if l.size() < 64 || l.align() > 16 { return System.alloc(l); }
+                let p = if outside(l.size()) {
+                    let malloc: extern "C" fn(usize) -> *mut u8 = std::mem::transmute(MALLOC_FNusize);
+                    malloc(l.size())
+                } else {
+                    let raw = System.alloc(Layout::from_size_align_unchecked(l.size() + 16, 16));
+                    if raw.is_null() { return raw; }
+                    raw.cast::<usize>().write(l.size());
+                    raw.add(8).cast::<u64>().write(0x714e);
+                    raw.add(16)
+                };
+                if !p.is_null() && l.align() == 1 { ALLOCS.fetch_add(1, Ordering::Relaxed); }
+                p
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                if l.size() < 64 || l.align() > 16 { return System.dealloc(p, l); }
+                if outside(l.size()) {
+                    let free: extern "C" fn(*mut u8) = std::mem::transmute(FREE_FNusize);
+                    free(p);
+                } else {
+                    let raw = p.sub(16);
+                    // Probes free blocks before the entry receives its API.
+                    let fail: Fail = std::mem::transmute(FAIL_FNusize);
+                    if raw.cast::<usize>().read() != l.size() { return fail(8); }
+                    if raw.add(8).cast::<u64>().read() != 0x714e { return fail(9); }
+                    raw.add(8).cast::<u64>().write(0);
+                    System.dealloc(raw, Layout::from_size_align_unchecked(l.size() + 16, 16));
+                }
+                if l.align() == 1 { FREES.fetch_add(1, Ordering::Relaxed); }
+            }
+        }
+    "#.replace("MAP_FN", &(map_large as *const () as usize).to_string())
+        .replace("FAIL_FN", &(fail as *const () as usize).to_string())
+        .replace("MALLOC_FN", &(malloc as *const () as usize).to_string())
+        .replace("FREE_FN", &(free as *const () as usize).to_string());
+    let pa_source = format!("{source}{allocator}");
+    for (src, classes) in [(pa_source.as_str(), &["registered", "refused", "unrouted"][..]), (source, &["default"][..])] {
+        let (mut u, entry, root) = fixture_of(src, "fixture");
+        let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "fixture").unwrap().krate;
+        crate::layout::set_root_crate(krate);
+        u.tier1 = None;
+        for &class in classes {
+            eprintln!("callback sink launch: {class}");
+            let has_pa = class != "default";
+            assert_eq!(u.global_allocator_static().is_some(), has_pa, "the fixture declares the selected allocator for {class}");
+            ROUTED.store(class == "registered", Ordering::Relaxed);
+            MAP_LARGE.store(class == "refused", Ordering::Relaxed);
+            let routing = if class == "unrouted" { FixtureRouting::Disabled } else { FixtureRouting::Probed };
+            let api = [emit as *const () as usize, live as *const () as usize, has_pa as usize, fail as *const () as usize];
+            let (id, _, main) = launch_with_routing(&mut u, entry, None, api.as_ptr() as u64, routing).unwrap();
+            main.join().unwrap();
+            wait_thread_done(id);
+            let check = FIRST_FAILURE.load(Ordering::Relaxed);
+            assert_eq!(check, 0, "{class}, accounting={report}, fixture check {check} failed: {}", match check {
+                1 => "the sink must own a copy of the borrowed bytes",
+                2 => "the sink must return every byte",
+                3 => "the caller must grow the sink's allocation",
+                4 => "growth must preserve both endpoints and the appended byte",
+                5 => "the PA must allocate the original and grown buffers",
+                6 => "the PA must free both buffers",
+                7 => "the warmed round trip must restore the live-byte baseline",
+                8 => "the freed layout must match its header",
+                9 => "the freed buffer must have the PA's canary",
+                _ => "unrecognized check number",
+            });
+            // The first launch compiled the checked shims. On the unrouted heap they forward to the PA.
+            assert_eq!(u.routes_allocator, has_pa && class != "unrouted", "the unit has the routing mode selected for {class}");
+            assert_eq!(state(id), Some(DomainState::Exited(0)), "the {class} domain exits after both callback sizes");
+            eprintln!("callback sink launch: done");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 // The same native op as the locked-op fixture, with a PA that can serve a static page,
