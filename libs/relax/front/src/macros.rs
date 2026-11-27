@@ -1357,8 +1357,10 @@ impl<'a> Res<'a> {
         let Some(cm) = self.table.crates.get(k) else { return false };
         let Some(sc) = self.scope(k) else { return false };
         if sc.mnon.get(m).and_then(|t| t.get(name)).is_some_and(|(_, v)| !v.visible_to_req(k, m, k, req)) { return false; }
-        if let Some(u) = cm.uses.get(m).into_iter().flatten().find(|u| u.bind.as_deref() == Some(name)) {
-            return u.vis.resolve(&cm.root, m).visible_to_req(k, m, k, req);
+        if cm.uses.get(m).into_iter().flatten().any(|u| {
+            u.bind.as_deref() == Some(name) && u.vis.resolve(&cm.root, m).visible_to_req(k, m, k, req)
+        }) {
+            return true;
         }
         sc.tglobs.get(m).into_iter().flatten().any(|(k2, m2, edge)| {
             edge.visible_to_req(k, m, k, req) && self.import_binds(k2, m2, next_req(k, m, k2, req), name, seen)
