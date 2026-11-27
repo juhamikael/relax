@@ -7048,6 +7048,54 @@ impl Unit {
         }
     }
 
+    /// A fixture changed allocator routing. Re-lower the heap entries and any callers
+    /// that inlined their old bodies before running the fixture again.
+    #[cfg(test)]
+    pub(crate) fn reset_allocator_shims(&mut self) {
+        let mut work = std::collections::VecDeque::new();
+        let mut seed = |name, args| {
+            if let Some(def) = self.core_path(&["heap", name]) {
+                if let Some(id) = self.fn_map.get(&FnKey::Inst(def, args)) {
+                    work.push_back(id);
+                }
+            }
+        };
+        for name in ["alloc", "alloc_zeroed", "dealloc", "realloc"] {
+            seed(name, Vec::new());
+        }
+        if let Some((_, alloc_ty)) = self.global_allocator() {
+            for name in ["__rg_checked_alloc", "__rg_checked_alloc_zeroed", "__rg_checked_dealloc", "__rg_checked_realloc",
+                         "__rg_alloc", "__rg_alloc_zeroed", "__rg_dealloc", "__rg_realloc"] {
+                seed(name, vec![alloc_ty]);
+            }
+        }
+
+        let mut seen = crate::fxhash::HashSet::default();
+        while let Some(id) = work.pop_front() {
+            if !seen.insert(id) { continue; }
+            let f = &mut self.fns[id as usize];
+            work.extend(f.history().inlined_into.iter().copied());
+            if !f.compiled && f.rir.is_none() { continue; }
+            if f.compiled && f.code_len != 0 {
+                let old_map = std::mem::take(&mut f.pc_map);
+                crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map, f.patch_gen)));
+            }
+            let stub = self.slots.stub(id);
+            f.code = stub;
+            f.code_len = 0;
+            f.compiled = false;
+            f.rir = None;
+            f.normal_rir = None;
+            f.lowering = None;
+            f.o3.store(false, Ordering::Relaxed);
+            f.version += 1;
+            SlotWord::of(&self.slots, id).store(stub, Ordering::SeqCst);
+            if matches!(f.key, FnKey::Plain(_)) {
+                self.follow_twin(id);
+            }
+        }
+    }
+
     /// `size` bytes of the code window at `align`, counted as what they are for (`kind`, WIN_NAMES).
     fn code_bump(&self, kind: usize, size: u64, align: u64) -> u64 {
         let at = bump(&self.code_next, size, align, self.code_end, "out of code memory");

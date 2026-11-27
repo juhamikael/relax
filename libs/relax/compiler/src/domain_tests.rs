@@ -99,12 +99,19 @@ fn launch_with_routing(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64,
     .unwrap();
     let loading = Loading(id);
     let base = create(u);
-    let allocator = ProgramAllocatorCtx::resolve(u).expect("resolve the fixture allocator");
     // A fixture's #[global_allocator] becomes its domain's PA with no provided crate bound (the
     // test sets the root crate after fixture_of, so Unit::new could not see it): its shims check,
     // as a routing program's do, before the program's code is made.
-    let allocator = allocator.filter(|_| routing != FixtureRouting::Disabled);
-    u.routes_allocator = allocator.is_some();
+    let allocator = if routing != FixtureRouting::Disabled {
+        ProgramAllocatorCtx::resolve(u).expect("resolve the fixture allocator")
+    } else {
+        None
+    };
+    let routes = allocator.is_some();
+    if u.routes_allocator != routes {
+        u.routes_allocator = routes;
+        u.reset_allocator_shims();
+    }
     let heap = ProgramHeap::new(base, allocator).unwrap();
     let probe = routing == FixtureRouting::Probed;
     if probe {
@@ -1689,6 +1696,8 @@ fn jit_frees_a_counted_loader_buffer() {
 
 #[test]
 fn host_op_callback_sink_safe_across_all_classes_and_memstat() {
+    use crate::jit::FnKey;
+
     const CHILD: &str = "RELAX_TEST_CALLBACK_SINK_REPORT";
     let Ok(report) = std::env::var(CHILD) else {
         let test = "domain::teardown_tests::host_op_callback_sink_safe_across_all_classes_and_memstat";
@@ -1847,6 +1856,13 @@ fn host_op_callback_sink_safe_across_all_classes_and_memstat() {
             MAP_LARGE.store(class == "refused", Ordering::Relaxed);
             let routing = if class == "unrouted" { FixtureRouting::Disabled } else { FixtureRouting::Probed };
             let api = [emit as *const () as usize, live as *const () as usize, has_pa as usize, fail as *const () as usize];
+            let unrouted_shims = (class == "unrouted").then(|| {
+                let (_, alloc_ty) = u.global_allocator().expect("the unrouted fixture has a program allocator");
+                let shim = |name| FnKey::Inst(u.core_path(&["heap", name]).unwrap(), vec![alloc_ty]);
+                let realloc = shim("__rg_realloc");
+                assert!(u.fn_map.get(&realloc).is_none(), "the registered and refused launches must leave __rg_realloc uninstantiated");
+                (realloc, shim("__rg_dealloc"), shim("__rg_checked_dealloc"))
+            });
             let (id, _, main) = launch_with_routing(&mut u, entry, None, api.as_ptr() as u64, routing).unwrap();
             main.join().unwrap();
             wait_thread_done(id);
@@ -1863,7 +1879,19 @@ fn host_op_callback_sink_safe_across_all_classes_and_memstat() {
                 9 => "the freed buffer must have the PA's canary",
                 _ => "unrecognized check number",
             });
-            // The first launch compiled the checked shims. On the unrouted heap they forward to the PA.
+            if let Some((realloc, dealloc, checked_dealloc)) = unrouted_shims {
+                let id = u.fn_map.get(&realloc).expect("the unrouted launch instantiates __rg_realloc");
+                let f = &u.fns[id as usize];
+                assert!(f.compiled || f.rir.is_some(), "the unrouted launch must build __rg_realloc");
+                let entry = FnKey::Inst(u.core_path(&["heap", "dealloc"]).unwrap(), Vec::new());
+                let slot = u.fn_map.get(&entry).expect("the fixture uses core::heap::dealloc");
+                // `calls` holds the lowered body's callees before inlining: the shim itself is inlined
+                // into core::heap::dealloc, which then calls the PA's dealloc directly.
+                let calls = &u.fns[slot as usize].calls;
+                let calls_shim = |key: &FnKey| calls.iter().any(|&id| &u.fns[id as usize].key == key);
+                assert!(calls_shim(&dealloc), "unrouted core::heap::dealloc must call __rg_dealloc");
+                assert!(!calls_shim(&checked_dealloc), "unrouted core::heap::dealloc still calls __rg_checked_dealloc");
+            }
             assert_eq!(u.routes_allocator, has_pa && class != "unrouted", "the unit has the routing mode selected for {class}");
             assert_eq!(state(id), Some(DomainState::Exited(0)), "the {class} domain exits after both callback sizes");
             eprintln!("callback sink launch: done");
