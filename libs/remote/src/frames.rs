@@ -5,7 +5,7 @@
 //! side. The app registers the service (`Endpoint::register("frames", 1, ..)`); this module is the
 //! record format and the client side of it. A capture subscription (`cap=1`) also takes `rle`,
 //! `h264` or `hevc`. Video DATA carries an encoded access unit, its `key` flag and its `pts` in
-//! 100 ns units. Its first header adds `codecs` (strings) and `full_chroma` (an encoder capability).
+//! 100 ns units. Its `chroma` is the opened format (`420` or `444`). Its first header adds `codecs` (strings) and `full_chroma` (an encoder capability).
 //! Send `key`, `kbps=N` or `fps=N` as UTF-8 DATA on that channel to steer the subscription.
 
 use crate::conn::{Event, CLOSE_NORMAL};
@@ -60,6 +60,8 @@ pub struct Request {
     pub raw: bool,
     /// Explicit codec (`png`, `raw`, `rle`, `h264` or `hevc`). Video codecs require `cap`.
     pub codec: Option<&'static str>,
+    /// Request 4:4:4 chroma from a video encoder. The default is 4:2:0.
+    pub full_chroma: bool,
     /// a fixed number of frames; none = until the channel is closed
     pub n: Option<usize>,
     pub fps: Option<f64>,
@@ -97,6 +99,9 @@ impl Request {
         }
         if self.cap {
             a.push("cap=1".into());
+        }
+        if self.full_chroma {
+            a.push("chroma=444".into());
         }
         a.join(" ")
     }

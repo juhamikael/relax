@@ -636,7 +636,7 @@ fn grab_json(r: &Record, path: &Path) -> String {
 
 /// One frame of `window`, written to `out` or the next file of the grab folder.
 fn grab_one(client: &Client, window: Option<usize>, scale: f64, out: Option<&str>) -> Result<(Record, PathBuf), String> {
-    let req = frames::Request { window, scale: Some(scale), raw: false, codec: None, n: Some(1), fps: None, cap: false };
+    let req = frames::Request { window, scale: Some(scale), raw: false, full_chroma: false, codec: None, n: Some(1), fps: None, cap: false };
     let mut got = None;
     frames::fetch(client, &req, &mut |r| {
         got = Some(r);
@@ -674,7 +674,7 @@ fn rec(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
         Some(d) => { std::fs::create_dir_all(d).map_err(|e| format!("rec out: {e}"))?; PathBuf::from(d) }
         None => grab_dir(client)?,
     };
-    let req = frames::Request { window: window_of(kv), scale: Some(get(kv, &["scale"]).and_then(|v| v.parse().ok()).unwrap_or(0.5)), raw, codec: (codec == "rle").then_some("rle"), n: None, fps: Some(fps), cap: true };
+    let req = frames::Request { window: window_of(kv), scale: Some(get(kv, &["scale"]).and_then(|v| v.parse().ok()).unwrap_or(0.5)), raw, full_chroma: false, codec: (codec == "rle").then_some("rle"), n: None, fps: Some(fps), cap: true };
     let started = std::time::Instant::now();
     let (mut count, mut first, mut last, mut size, mut dropped) = (0u64, None::<u64>, 0u64, (0u32, 0u32), 0u64);
     let (mut t_first, mut t_last) = (None::<f64>, 0f64);
@@ -749,7 +749,7 @@ fn gseq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
         }
         None => grab_dir(client)?,
     };
-    let req = frames::Request { window: window_of(kv), scale: Some(scale_of(kv)), raw: false, codec: None, n: Some(n), fps: Some(1000.0 / every_ms as f64), cap: false };
+    let req = frames::Request { window: window_of(kv), scale: Some(scale_of(kv)), raw: false, full_chroma: false, codec: None, n: Some(n), fps: Some(1000.0 / every_ms as f64), cap: false };
     let (mut paths, mut frame_json, mut pinned) = (Vec::new(), Vec::new(), Vec::new());
     frames::fetch(client, &req, &mut |r| {
         let index = frame_json.len();
