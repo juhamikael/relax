@@ -144,6 +144,99 @@ pub fn local_inner_macros(d: &mut MacroDef) {
     }
 }
 
+/// Visibility of a prescanned import or module declaration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UseVis {
+    #[default]
+    Private,
+    Pub,
+    Crate,
+    Super,
+    In(Vec<String>),
+}
+
+impl UseVis {
+    pub fn is_pub(&self) -> bool { matches!(self, Self::Pub) }
+    pub fn is_restricted_or_pub(&self) -> bool { !matches!(self, Self::Private) }
+}
+
+/// A restriction is an ancestor prefix of the binding's owner. After a successful
+/// visibility check the same prefix also belongs to the importing module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScopeVis(u32);
+
+impl ScopeVis {
+    const PUB: Self = Self(u32::MAX);
+    fn private(m: &str) -> Self { Self(m.len() as u32) }
+    fn krate(root: &str, m: &str) -> Self { Self::in_ancestor(m, root).unwrap_or_else(|| Self::private(m)) }
+    fn super_of(m: &str) -> Self { Self::private(m.rsplit_once("::").map_or(m, |(p, _)| p)) }
+    fn in_ancestor(m: &str, ancestor: &str) -> Option<Self> { within(m, ancestor).then(|| Self::private(ancestor)) }
+    fn is_pub(self) -> bool { self == Self::PUB }
+    fn visible_to_req(self, k: &str, m: &str, asker_k: &str, req: Option<&str>) -> bool {
+        self.is_pub() || (k == asker_k && req.is_some_and(|asker| within(asker, &m[..self.0 as usize])))
+    }
+    fn visible_to(self, k: &str, m: &str, asker_k: &str, asker: &str) -> bool {
+        self.visible_to_req(k, m, asker_k, Some(asker))
+    }
+    fn min(self, other: Self) -> Self {
+        if self.is_wider_than(other) { other } else { self }
+    }
+    fn is_wider_than(self, other: Self) -> bool {
+        !other.is_pub() && (self.is_pub() || self.0 < other.0)
+    }
+}
+
+fn within(m: &str, ancestor: &str) -> bool {
+    m == ancestor || m.strip_prefix(ancestor).is_some_and(|rest| rest.starts_with("::"))
+}
+
+fn common_mod_prefix<'a>(mut a: &'a str, b: &str) -> &'a str {
+    while !within(b, a) {
+        let Some((parent, _)) = a.rsplit_once("::") else { return ""; };
+        a = parent;
+    }
+    a
+}
+
+/// A transitive glob binding must be visible to the caller and each importer.
+fn next_req<'a>(k: &str, m: &str, target: &str, req: Option<&'a str>) -> Option<&'a str> {
+    if k != target { return None; }
+    req.map(|r| common_mod_prefix(r, m)).filter(|p| !p.is_empty())
+}
+
+impl UseVis {
+    fn ancestor(&self, root: &str, module: &str) -> Option<ScopeVis> {
+        let Self::In(path) = self else {
+            return Some(match self {
+                Self::Private => ScopeVis::private(module),
+                Self::Pub => ScopeVis::PUB,
+                Self::Crate => ScopeVis::krate(root, module),
+                Self::Super => ScopeVis::super_of(module),
+                Self::In(_) => unreachable!(),
+            });
+        };
+        let (first, rest) = path.split_first()?;
+        let (mut candidate, segments) = match first.as_str() {
+            "crate" | "" => (root.to_string(), rest),
+            "self" => (module.to_string(), rest),
+            "super" => (module.to_string(), path.as_slice()),
+            _ => (root.to_string(), path.as_slice()),
+        };
+        for segment in segments {
+            match segment.as_str() {
+                "self" => {}
+                "super" => { if let Some(pos) = candidate.rfind("::") { candidate.truncate(pos); } }
+                ident => { candidate.push_str("::"); candidate.push_str(ident); }
+            }
+        }
+        ScopeVis::in_ancestor(module, &candidate)
+    }
+
+    fn resolve(&self, root: &str, module: &str) -> ScopeVis {
+        self.ancestor(root, module).unwrap_or_else(|| ScopeVis::private(module))
+    }
+}
+
 /// One `use` declaration's binding, as the preload scan reads it: in module `module` (module path
 /// as `module_path!` prints it, `krate::a::b`), the path `path` (first segment as written:
 /// `crate`, `self`, `super`, `$crate` as `__relax_crate_<name>`, `""` for a leading `::`) is
@@ -153,7 +246,7 @@ pub struct UseItem {
     pub module: String,
     pub path: Vec<String>,
     pub bind: Option<String>,
-    pub is_pub: bool,
+    pub vis: UseVis,
 }
 
 /// One crate's module tree and imports (for macro path resolution before name resolution:
@@ -162,13 +255,12 @@ pub struct UseItem {
 /// (`pos`: its `mod` keyword, `end`: the end of the item -- its `;` or closing brace) and whether
 /// it carries `#[macro_use]`. rustc's legacy `macro_rules!` scope is made of these
 /// (rustc_resolve build_reduced_graph.rs: `MacroRulesScope`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModItem {
     pub pos: u32,
     pub end: u32,
     pub macro_use: bool,
-    /// a plain `pub mod`: another crate sees the module through a glob of its parent
-    pub is_pub: bool,
+    pub vis: UseVis,
 }
 
 #[derive(Default)]
@@ -212,9 +304,11 @@ pub struct FileImports {
 impl FileImports {
     /// The same imports (`mod` items only move with the text around them).
     pub fn same_as(&self, other: &FileImports) -> bool {
-        let items = |f: &'_ FileImports| f.mod_items.iter().map(|(m, i)| (m.clone(), i.macro_use, i.is_pub)).collect::<Vec<_>>();
+        fn items(f: &FileImports) -> impl Iterator<Item = (&String, bool, &UseVis)> {
+            f.mod_items.iter().map(|(m, i)| (m, i.macro_use, &i.vis))
+        }
         self.uses == other.uses && self.aliases == other.aliases && self.macro_use == other.macro_use && self.mods == other.mods
-            && self.inner_macro_use == other.inner_macro_use && items(self) == items(other)
+            && self.inner_macro_use == other.inner_macro_use && items(self).eq(items(other))
     }
 }
 
@@ -342,21 +436,19 @@ pub struct CrateScope {
     /// module -> name -> (crate, module) of its non-glob bindings; its glob imports' source
     /// modules in source order (searched on demand: copying every module's names into every
     /// glob importer costs more than the few path lookups that need them)
-    tnon: HashMap<String, HashMap<String, (String, String)>>,
-    /// module -> the names of its non-glob bindings another crate cannot see (a private `mod`,
-    /// a private `use`): a glob of the module from another crate does not import them
-    tpriv: HashMap<String, crate::fxhash::HashSet<String>>,
-    /// glob sources, with whether the glob import is `pub` (another crate's glob follows only those)
-    tglobs: HashMap<String, Vec<(String, String, bool)>>,
+    tnon: HashMap<String, HashMap<String, (String, String, ScopeVis)>>,
+    /// Glob sources and the visibility of each import.
+    tglobs: HashMap<String, Vec<(String, String, ScopeVis)>>,
     /// module -> name -> macro, non-glob then glob
-    mnon: HashMap<String, HashMap<String, MacroRef>>,
-    mglob: HashMap<String, HashMap<String, MacroRef>>,
+    mnon: HashMap<String, HashMap<String, (MacroRef, ScopeVis)>>,
+    mglob: HashMap<String, HashMap<String, (MacroRef, ScopeVis)>>,
     /// this computation's identity (unique per process, never 0): a memoized answer that went
     /// through another crate's scope holds while that crate still has this very scope
     id: u64,
     /// module -> name -> the answer of `Res::type_in` (a glob walk can visit hundreds of
     /// modules; the same few names are asked from the same modules over and over)
     memo: std::sync::RwLock<HashMap<String, HashMap<String, TypeInMemo>>>,
+    pub_memo: std::sync::RwLock<HashMap<String, HashMap<String, TypeInMemo>>>,
 }
 
 static SCOPE_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -696,7 +788,7 @@ impl MacroTable {
         let r = Res { table: self };
         let Some((k, m)) = (if path.is_empty() { Some((cur, module)) } else { r.resolve_mod(cur, module, path) }) else { return (false, None) };
         let mut seen = Seen::new();
-        (r.import_binds(cur, k, m, module, name, &mut seen), Some((k.to_string(), m.to_string())))
+        (r.import_binds(k, m, (cur == k).then_some(module), name, &mut seen), Some((k.to_string(), m.to_string())))
     }
 
     /// Records an import alias of crate `krate` (copies that crate's map only if a snapshot
@@ -892,7 +984,7 @@ impl MacroTable {
             if b == GLOB {
                 for g in split_globs(path) {
                     if !v.iter().any(|u| u.bind.is_none() && u.path == g) {
-                        v.push(UseItem { module: m.clone(), path: g, bind: None, is_pub: true });
+                        v.push(UseItem { module: m.clone(), path: g, bind: None, vis: UseVis::Pub });
                         added = true;
                     }
                 }
@@ -908,7 +1000,7 @@ impl MacroTable {
             if v.iter().any(|u| u.bind.as_deref() == Some(b.as_str()) && &u.path == path) {
                 continue;
             }
-            v.push(UseItem { module: m.clone(), path: path.clone(), bind: Some(b.clone()), is_pub: true });
+            v.push(UseItem { module: m.clone(), path: path.clone(), bind: Some(b.clone()), vis: UseVis::Pub });
             if path.last() != Some(b) {
                 renames.insert(b.clone());
             }
@@ -983,7 +1075,7 @@ fn lookup_in_t<S: AsRef<str>>(table: &MacroTable, local: &[MacroRef], name: &str
                 return Some(d.clone());
             }
         }
-        if let Some(d) = r.macro_in(k, m, name) {
+        if let Some(d) = r.macro_in(cur, module, k, m, name) {
             return Some(d);
         }
         // Relax's std does not mirror std's module layout for its macros (`std::mem::offset_of!`
@@ -1007,14 +1099,14 @@ fn lookup_after_textual(table: &MacroTable, name: &str, cur: &str, module: &str)
     let r = Res { table };
     let cm = table.crates.get(cur);
     // the module's imports (non-glob, then glob)
-    if let Some(d) = r.macro_in(cur, module, name) {
+    if let Some(d) = r.macro_in(cur, module, cur, module, name) {
         return Some(d);
     }
     if let Some(us) = table.macro_use.get(cur) {
         for u in us.iter().rev() {
             let u_key = cm.and_then(|c| c.externs.get(u.as_str())).map(|s| s.as_str()).unwrap_or(u.as_str());
             let (_, root) = r.crate_root(u_key);
-            if let Some(d) = r.exported_in(u_key, root, name, &mut Default::default()) {
+            if let Some(d) = r.exported_in(u_key, root, name) {
                 return Some(d);
             }
         }
@@ -1026,6 +1118,8 @@ fn lookup_after_textual(table: &MacroTable, name: &str, cur: &str, module: &str)
 #[derive(Default)]
 pub(crate) struct ProcReach(HashMap<(String, String), std::rc::Rc<crate::fxhash::HashSet<String>>>);
 
+type MacroWalkSeen = crate::fxhash::HashSet<(String, String, String, usize)>;
+
 struct Res<'a> {
     table: &'a MacroTable,
 }
@@ -1034,40 +1128,41 @@ struct Res<'a> {
 /// sit on the stack and compare by content; a query that walks a large glob web spills to a hash
 /// set. Nothing is allocated or copied per lookup (the strings are borrowed from the scopes).
 struct Seen<'b> {
-    near: [(&'b str, &'b str); 16],
+    near: [(&'b str, &'b str, usize); 16],
     n: usize,
-    spill: Option<crate::fxhash::HashSet<(&'b str, &'b str)>>,
+    spill: Option<HashMap<(&'b str, &'b str), usize>>,
 }
 
 impl<'b> Seen<'b> {
-    fn new() -> Self {
-        Seen { near: [("", ""); 16], n: 0, spill: None }
-    }
+    fn new() -> Self { Self { near: [("", "", 0); 16], n: 0, spill: None } }
 
-    /// Adds (k, m); false when it was there already.
-    fn insert(&mut self, k: &'b str, m: &'b str) -> bool {
-        if let Some(s) = &mut self.spill {
-            return s.insert((k, m));
+    fn insert(&mut self, k: &'b str, m: &'b str, req: Option<&str>) -> bool {
+        let len = req.map_or(0, |r| common_mod_prefix(m, r).len());
+        if self.spill.is_none() {
+            for (prev_k, prev_m, widest) in &mut self.near[..self.n] {
+                if (*prev_k, *prev_m) == (k, m) {
+                    if *widest >= len { return false; }
+                    *widest = len;
+                    return true;
+                }
+            }
+            if self.n < self.near.len() {
+                self.near[self.n] = (k, m, len);
+                self.n += 1;
+                return true;
+            }
+            self.spill = Some(self.near.iter().map(|&(k, m, n)| ((k, m), n)).collect());
         }
-        if self.near[..self.n].iter().any(|&(a, b)| a == k && b == m) {
-            return false;
-        }
-        if self.n < self.near.len() {
-            self.near[self.n] = (k, m);
-            self.n += 1;
-        } else {
-            let mut s: crate::fxhash::HashSet<(&'b str, &'b str)> = self.near.iter().copied().collect();
-            s.insert((k, m));
-            self.spill = Some(s);
-        }
+        let spill = self.spill.as_mut().unwrap();
+        if spill.get(&(k, m)).is_some_and(|&prev| prev >= len) { return false; }
+        spill.insert((k, m), len);
         true
     }
 
-    /// Every (crate, module) visited, in no particular order.
     fn each(&self, mut f: impl FnMut(&'b str, &'b str)) {
         match &self.spill {
-            Some(s) => s.iter().for_each(|&(k, m)| f(k, m)),
-            None => self.near[..self.n].iter().for_each(|&(k, m)| f(k, m)),
+            Some(s) => s.keys().for_each(|&(k, m)| f(k, m)),
+            None => self.near[..self.n].iter().for_each(|&(k, m, _)| f(k, m)),
         }
     }
 }
@@ -1079,29 +1174,34 @@ impl<'a> Res<'a> {
     }
 
     /// `#[macro_use] extern crate` imports public root macro bindings, including re-exports.
-    /// Resolve their public import paths rather than exposing private root imports through
-    /// `macro_in`. A renamed export can change the queried name while traversing a cycle.
-    fn exported_in(&self, k: &str, m: &str, name: &str, seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<MacroRef> {
-        if !seen.insert((k.into(), m.into(), name.into())) { return None; }
-        if self.crate_root(k).1 == m {
-            if let Some(d) = self.exported(k, name) { return Some(d); }
+    fn exported_in(&self, k: &str, m: &str, name: &str) -> Option<MacroRef> {
+        self.macro_in_vis(k, None, k, m, name).map(|(d, _)| d)
+    }
+
+    /// Resolve an import's prefix where it was written, then check its leaf
+    /// against the visibility required by the caller and intervening imports.
+    fn imported_macro<T>(&self, k: &str, m: &str, name: &str, req: Option<&str>, seen: &mut MacroWalkSeen,
+        leaf: &impl Fn(&str, &str, &str) -> Option<T>) -> Option<T> {
+        let depth = req.map_or(0, |r| common_mod_prefix(m, r).len());
+        if !seen.insert((k.into(), m.into(), name.into(), depth)) { return None; }
+        if let Some(value) = leaf(k, m, name) { return Some(value); }
+        let cm = self.table.crates.get(k)?;
+        let uses = cm.uses.get(m)?;
+        let visible = |u: &UseItem| u.vis.resolve(&cm.root, m).visible_to_req(k, m, k, req);
+        for u in uses.iter().filter(|u| u.bind.as_deref() == Some(name) && visible(u)) {
+            let Some((target, prefix)) = u.path.split_last() else { continue; };
+            let Some((tk, tm)) = self.import_prefix(k, m, prefix) else { continue; };
+            if let Some(value) = self.imported_macro(tk, tm, target, next_req(k, m, tk, req), seen, leaf) { return Some(value); }
         }
-        let uses = self.table.crates.get(k)?.uses.get(m)?;
-        for u in uses.iter().filter(|u| u.is_pub && u.bind.as_deref() == Some(name)) {
-            if let Some(d) = self.exported_path(k, m, &u.path, seen) { return Some(d); }
-        }
-        for u in uses.iter().filter(|u| u.is_pub && u.bind.is_none()) {
-            let mut path = u.path.clone();
-            path.push(name.into());
-            if let Some(d) = self.exported_path(k, m, &path, seen) { return Some(d); }
+        for u in uses.iter().filter(|u| u.bind.is_none() && visible(u)) {
+            let Some((tk, tm)) = self.import_prefix(k, m, &u.path) else { continue; };
+            if let Some(value) = self.imported_macro(tk, tm, name, next_req(k, m, tk, req), seen, leaf) { return Some(value); }
         }
         None
     }
 
-    fn exported_path(&self, k: &str, m: &str, path: &[String], seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<MacroRef> {
-        let (name, prefix) = path.split_last()?;
-        let (k, m) = if prefix.is_empty() { (k, m) } else { self.resolve_mod(k, m, prefix)? };
-        self.exported_in(k, m, name, seen)
+    fn import_prefix<'b>(&self, k: &'b str, m: &'b str, path: &'b [String]) -> Option<(&'b str, &'b str)> where 'a: 'b {
+        if path.is_empty() { Some((k, m)) } else { self.resolve_mod(k, m, path) }
     }
 
     fn std_prelude(&self, name: &str) -> Option<MacroRef> {
@@ -1157,118 +1257,112 @@ impl<'a> Res<'a> {
     where
         'a: 'b,
     {
+        self.cached_type(k, m, n, false)
+    }
+
+    fn type_in_as<'b>(&self, from: &str, req: Option<&str>, k: &'b str, m: &'b str, n: &str) -> Option<(&'b str, &'b str)>
+    where 'a: 'b {
+        if k == from && req.is_some_and(|r| within(r, m)) { return self.type_in(k, m, n); }
+        let req = req.filter(|_| k == from);
+        let sc = self.scope(k)?;
+        if let Some((tk, tm, vis)) = sc.tnon.get(m).and_then(|t| t.get(n)) {
+            return vis.visible_to_req(k, m, from, req).then_some((tk, tm));
+        }
+        if !sc.tglobs.contains_key(m) { return None; }
+        if req.is_none() { return self.cached_type(k, m, n, true); }
+        self.type_in_seen(k, m, n, req, None).map(|(tk, tm, _)| (tk, tm))
+    }
+
+    fn cached_type<'b>(&self, k: &'b str, m: &'b str, n: &str, public: bool) -> Option<(&'b str, &'b str)>
+    where 'a: 'b {
         let binding = |at: &Option<(String, String)>| {
             let (c, at) = at.as_ref()?;
             let t = self.table.crates.get(c.as_str())?.scope.get()?.tnon.get(at.as_str())?.get(n)?;
             Some((t.0.as_str(), t.1.as_str()))
         };
-        if let Some(at) = self.table.type_snapshot.0.read().unwrap().get(k).and_then(|c| c.get(m)).and_then(|t| t.get(n)) {
-            return binding(at);
+        if !public {
+            if let Some(at) = self.table.type_snapshot.0.read().unwrap().get(k).and_then(|c| c.get(m)).and_then(|t| t.get(n)) {
+                return binding(at);
+            }
         }
         let remember = |at| {
-            self.table.type_snapshot.0.write().unwrap().entry(k.to_string()).or_default()
-                .entry(m.to_string()).or_default().insert(n.to_string(), at);
+            if !public {
+                self.table.type_snapshot.0.write().unwrap().entry(k.to_string()).or_default()
+                    .entry(m.to_string()).or_default().insert(n.to_string(), at);
+            }
         };
         let sc = self.scope(k)?;
+        let memo = if public { &sc.pub_memo } else { &sc.memo };
         let scope_id = |c: &str| self.table.crates.get(c).and_then(|cm| cm.scope.get()).map_or(0, |s| s.id);
-        if let Some(e) = sc.memo.read().unwrap().get(m).and_then(|t| t.get(n)) {
+        if let Some(e) = memo.read().unwrap().get(m).and_then(|t| t.get(n)) {
             if e.deps.iter().all(|(c, id)| scope_id(c) == *id) {
                 remember(e.at.clone());
                 return binding(&e.at);
             }
         }
         let mut seen = Seen::new();
-        let found = self.glob_find(k, k, m, n, &mut seen, None, true);
-        let mut deps: Vec<(String, u64)> = Vec::new();
+        let found = self.glob_find(k, m, n, (!public).then_some(m), &mut seen, None);
+        let mut deps = Vec::new();
         seen.each(|c, _| {
-            if !deps.iter().any(|d| d.0 == c) {
-                deps.push((c.to_string(), scope_id(c)));
-            }
+            if !deps.iter().any(|(dep, _)| dep == c) { deps.push((c.to_string(), scope_id(c))); }
         });
-        let at = found.map(|(c, at, _)| (c.to_string(), at.to_string()));
+        let at = found.map(|(c, at, _, _)| (c.to_string(), at.to_string()));
         remember(at.clone());
-        sc.memo.write().unwrap().entry(m.to_string()).or_default().insert(n.to_string(), TypeInMemo { at, deps: deps.into_boxed_slice() });
-        found.map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
+        memo.write().unwrap().entry(m.to_string()).or_default().insert(n.to_string(), TypeInMemo { at, deps: deps.into_boxed_slice() });
+        found.map(|(_, _, t, _)| (t.0.as_str(), t.1.as_str()))
     }
 
-    /// `type_in` through glob sources (each module once per query); `partial`: the crate whose
-    /// scope is being computed and its tables so far.
-    fn type_in_seen<'b>(&self, from: &str, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>) -> Option<(&'b str, &'b str)>
-    where
-        'a: 'b,
-    {
-        self.glob_find(from, k, m, n, seen, partial, true).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
+    fn type_in_seen<'b>(&self, k: &'b str, m: &'b str, n: &str, req: Option<&str>, partial: Option<(&str, &'b CrateScope)>)
+        -> Option<(&'b str, &'b str, ScopeVis)> where 'a: 'b {
+        self.glob_find(k, m, n, req, &mut Seen::new(), partial)
+            .map(|(_, _, t, vis)| (t.0.as_str(), t.1.as_str(), vis))
     }
 
-    /// `type_in_seen`, with the (crate, module) whose non-glob bindings had the name. `from`: the
-    /// crate asking; a module of another crate, reached through a glob, gives only what that
-    /// crate exports (rustc: a glob imports the bindings visible to the importer), so its private
-    /// `mod serde_json` neither binds the name nor hides the extern crate of that name. In the
-    /// crate being computed, a miss of the module's own bindings waits while a single import of
-    /// the module may still bind the name (`scope_waits`); `vis`: the importing module sees the
-    /// module through the globs followed to it (a private glob of a module it is not inside
-    /// hides the module's imports from it).
-    fn glob_find<'b>(&self, from: &str, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>, vis: bool) -> Option<(&'b str, &'b str, &'b (String, String))>
-    where
-        'a: 'b,
-    {
-        if !seen.insert(k, m) {
-            return None;
-        }
-        let sc: &'b CrateScope = match partial {
-            Some((pk, psc)) if pk == k => psc,
+    /// Return the defining module (for memo replay), its binding and the effective
+    /// visibility through the globs that supplied it.
+    fn glob_find<'b>(&self, k: &'b str, m: &'b str, n: &str, req: Option<&str>, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>)
+        -> Option<(&'b str, &'b str, &'b (String, String, ScopeVis), ScopeVis)> where 'a: 'b {
+        if !seen.insert(k, m, req) { return None; }
+        let sc = match partial {
+            Some((pk, sc)) if pk == k => sc,
             _ => self.scope(k)?,
         };
-        let foreign = k != from;
         if let Some(t) = sc.tnon.get(m).and_then(|t| t.get(n)) {
-            // a binding the importer cannot see still shadows the module's globs of the name
-            if foreign && sc.tpriv.get(m).is_some_and(|p| p.contains(n)) { return None; }
-            return Some((k, m, t));
+            return t.2.visible_to_req(k, m, k, req).then_some((k, m, t, t.2));
         }
-        let computing = partial.is_some_and(|(pk, _)| pk == k);
-        if computing && vis && scope_waits(k, m, n, true) {
-            return None;
-        }
-        for (k2, m2, is_pub) in sc.tglobs.get(m).map_or(&[][..], |v| &v[..]) {
-            if foreign && !is_pub { continue; }
-            let vis = vis && (*is_pub || !computing || scope_asker_inside(m));
-            if let Some(t) = self.glob_find(from, k2, m2, n, seen, partial, vis) {
-                return Some(t);
+        if partial.is_some_and(|(pk, _)| pk == k) && scope_waits_req(k, m, n, true, req) { return None; }
+        for (k2, m2, edge) in sc.tglobs.get(m).into_iter().flatten() {
+            if edge.visible_to_req(k, m, k, req) {
+                if let Some((dk, dm, t, vis)) = self.glob_find(k2, m2, n, next_req(k, m, k2, req), seen, partial) {
+                    return Some((dk, dm, t, edge.min(vis)));
+                }
             }
         }
         None
     }
 
-    /// The macro a name denotes in module `m` of crate `k`.
-    fn macro_in(&self, k: &str, m: &str, n: &str) -> Option<MacroRef> {
+    fn macro_in_vis(&self, from: &str, req: Option<&str>, k: &str, m: &str, n: &str) -> Option<(MacroRef, ScopeVis)> {
         let sc = self.scope(k)?;
-        sc.mnon.get(m).and_then(|t| t.get(n)).or_else(|| sc.mglob.get(m).and_then(|t| t.get(n))).cloned()
+        sc.mnon.get(m).and_then(|t| t.get(n)).or_else(|| sc.mglob.get(m).and_then(|t| t.get(n)))
+            .filter(|(_, vis)| vis.visible_to_req(k, m, from, req)).cloned()
     }
 
-    /// Whether a `use` binds `name` (by that name) in module `m` of crate `k` as module `asker`
-    /// of crate `from` sees it: the module's own imports, then those its glob imports bring. A
-    /// private import is seen from its module and the modules inside it; through another
-    /// crate's module, or through a module `asker` is not inside, only `pub` imports and `pub`
-    /// globs count (rustc: a glob imports what is visible to the importing module).
-    fn import_binds<'b>(&self, from: &str, k: &'b str, m: &'b str, asker: &str, name: &str, seen: &mut Seen<'b>) -> bool
-    where
-        'a: 'b,
-    {
-        if !seen.insert(k, m) {
-            return false;
-        }
+    fn macro_in(&self, from: &str, asker: &str, k: &str, m: &str, n: &str) -> Option<MacroRef> {
+        self.macro_in_vis(from, Some(asker), k, m, n).map(|(d, _)| d)
+    }
+
+    fn import_binds<'b>(&self, k: &'b str, m: &'b str, req: Option<&str>, name: &str, seen: &mut Seen<'b>) -> bool
+    where 'a: 'b {
+        if !seen.insert(k, m, req) { return false; }
         let Some(cm) = self.table.crates.get(k) else { return false };
-        let inside = from == k && (asker == m || asker.strip_prefix(m).is_some_and(|rest| rest.starts_with("::")));
-        if cm.uses.get(m).is_some_and(|v| v.iter().any(|u| u.bind.as_deref() == Some(name) && (inside || u.is_pub))) {
-            return true;
-        }
         let Some(sc) = self.scope(k) else { return false };
-        for (k2, m2, is_pub) in sc.tglobs.get(m).map_or(&[][..], |v| &v[..]) {
-            if (inside || *is_pub) && self.import_binds(from, k2, m2, asker, name, seen) {
-                return true;
-            }
+        if sc.mnon.get(m).and_then(|t| t.get(name)).is_some_and(|(_, v)| !v.visible_to_req(k, m, k, req)) { return false; }
+        if let Some(u) = cm.uses.get(m).into_iter().flatten().find(|u| u.bind.as_deref() == Some(name)) {
+            return u.vis.resolve(&cm.root, m).visible_to_req(k, m, k, req);
         }
-        false
+        sc.tglobs.get(m).into_iter().flatten().any(|(k2, m2, edge)| {
+            edge.visible_to_req(k, m, k, req) && self.import_binds(k2, m2, next_req(k, m, k2, req), name, seen)
+        })
     }
 
     /// The module path `path` names from module `m` of crate `k` (type namespace), with
@@ -1277,7 +1371,7 @@ impl<'a> Res<'a> {
     where
         'a: 'b,
     {
-        resolve_path(self, k, m, path, &|kk, mm, n| self.type_in(kk, mm, n))
+        resolve_path(self, k, m, path, &|kk, mm, n| self.type_in_as(k, Some(m), kk, mm, n))
     }
 }
 
@@ -1337,17 +1431,15 @@ impl CrateScope {
         // child modules
         for m in &mods {
             if let Some((parent, name)) = m.rsplit_once("::") {
-                sc.tnon.entry(parent.to_string()).or_default().insert(name.to_string(), (k.to_string(), m.clone()));
-                if cm.items.get(m).is_some_and(|it| !it.is_pub) {
-                    sc.tpriv.entry(parent.to_string()).or_default().insert(name.to_string());
-                }
+                let vis = cm.items.get(m).map_or(ScopeVis::PUB, |it| it.vis.resolve(&cm.root, parent));
+                sc.tnon.entry(parent.to_string()).or_default().insert(name.to_string(), (k.to_string(), m.clone(), vis));
             }
         }
         // the root's `#[macro_export]` macros (the latest definition of each name)
-        let mut exported: HashMap<String, MacroRef> = HashMap::default();
+        let mut exported = HashMap::default();
         for (n, ds) in &table.defs {
             if let Some(d) = ds.iter().rev().find(|d| d.krate == krate_name(k) && d.exported) {
-                exported.insert(n.clone(), d.clone());
+                exported.insert(n.clone(), (d.clone(), ScopeVis::PUB));
             }
         }
         sc.mnon.insert(cm.root.clone(), exported);
@@ -1355,11 +1447,12 @@ impl CrateScope {
         let mut passes = 0;
         let mut copies = 0usize;
         let empty: Vec<UseItem> = Vec::new();
-        // per glob import: how many names its source had when last copied (a source that has
-        // not grown has nothing new to give)
-        let mut copied: HashMap<(String, usize), usize> = HashMap::default();
+        // A wider binding needs another copy even when the source's name count is unchanged.
+        let mod_index: HashMap<&str, usize> = mods.iter().enumerate().map(|(i, m)| (m.as_str(), i)).collect();
+        let mut rev = vec![1usize; mods.len()];
+        let mut copied: HashMap<(usize, usize), usize> = HashMap::default();
         // imports whose answer is final (found, or resolved into another crate's finished scope)
-        let mut settled: crate::fxhash::HashSet<(String, usize)> = crate::fxhash::HashSet::default();
+        let mut settled: crate::fxhash::HashSet<(usize, usize)> = crate::fxhash::HashSet::default();
         // rustc's fixpoint: a name a glob gives is undetermined while a single import of the module
         // may still bind it (ScopeRun). A stall makes the imports that failed without waiting stop
         // making names wait; one with none of those lifts the waits until the next binding
@@ -1374,7 +1467,7 @@ impl CrateScope {
             passes += 1;
             for (mi, m) in mods.iter().enumerate() {
                 for (ui, u) in cm.uses.get(m).unwrap_or(&empty).iter().enumerate() {
-                    if settled.contains(&(m.clone(), ui)) {
+                    if settled.contains(&(mi, ui)) {
                         continue;
                     }
                     if force && changed {
@@ -1382,17 +1475,18 @@ impl CrateScope {
                         forced += 1;
                     }
                     scope_try(mi, ui, !force);
+                    let import_vis = sc.resolve_use_vis(&r, k, &cm.root, m, &u.vis);
                     match &u.bind {
                         Some(b) => {
                             let (may_type, may_macro) = use_may_bind(table, u);
                             if !may_type && !may_macro {
-                                settled.insert((m.clone(), ui));
+                                settled.insert((mi, ui));
                                 continue;
                             }
                             // where the path's prefix leads: another crate's module is final
                             let prefix_crate = match u.path.split_last() {
                                 Some((_, prefix)) if !prefix.is_empty() && !(prefix.len() == 1 && prefix[0].is_empty()) => {
-                                    resolve_path(&r, k, m, prefix, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|x| x.0)
+                                    sc.import_module(&r, k, m, prefix).map(|x| x.0)
                                 }
                                 _ => None,
                             };
@@ -1403,40 +1497,50 @@ impl CrateScope {
                             }
                             if prefix_crate.map_or(false, |c| c != k) {
                                 // (its answer is final: what it does not bind now, it never binds)
-                                settled.insert((m.clone(), ui));
+                                settled.insert((mi, ui));
                                 scope_final();
                             }
                             // a module / crate under that name
                             let mut type_waited = false;
-                            if may_type && !sc.tnon.get(m).map_or(false, |t| t.contains_key(b)) {
-                                let t = resolve_path(&r, k, m, &u.path, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|(a, b)| (a.to_string(), b.to_string()));
+                            if may_type && sc.tnon.get(m).and_then(|t| t.get(b)).is_none_or(|old| import_vis.is_wider_than(old.2)) {
+                                let target = sc.import_type(&r, k, m, &u.path).map(|(tk, tm, vis)| (tk.to_string(), tm.to_string(), import_vis.min(vis)));
                                 type_waited = scope_take_wait();
-                                if let Some(t) = t.filter(|_| !type_waited) {
-                                    sc.tnon.entry(m.clone()).or_default().insert(b.clone(), t);
-                                    if !u.is_pub { sc.tpriv.entry(m.clone()).or_default().insert(b.clone()); }
-                                    changed = true;
+                                if let Some(target) = target.filter(|_| !type_waited) {
+                                    let bindings = sc.tnon.entry(m.clone()).or_default();
+                                    if bindings.get(b).is_none_or(|old| old.0 == target.0 && old.1 == target.1 && target.2.is_wider_than(old.2)) {
+                                        bindings.insert(b.clone(), target);
+                                        changed = true;
+                                    }
                                 }
                             }
-                            // a macro under that name
                             let mut macro_waited = false;
-                            if may_macro && !sc.mnon.get(m).map_or(false, |t| t.contains_key(b)) {
+                            if may_macro && sc.mnon.get(m).and_then(|t| t.get(b)).is_none_or(|old| import_vis.is_wider_than(old.1)) {
                                 let d = match u.path.split_last() {
                                     Some((last, prefix)) if prefix.is_empty() || (prefix.len() == 1 && prefix[0].is_empty()) => {
                                         // `use name;` of a macro in scope (2018 `pub use mac;`): the latest
                                         // macro_rules of the name in this module's textual scope (one of
                                         // the same name in another module is another macro)
                                         table.defs.get(last).and_then(|ds| ds.iter().rev().find(|d| d.krate == krate_name(k) && cm.in_textual_scope(d, m, None)).cloned())
+                                            .map(|d| {
+                                                let vis = if d.exported { ScopeVis::PUB } else { ScopeVis::krate(&cm.root, m) };
+                                                (d, vis)
+                                            })
                                     }
                                     Some((last, prefix)) => {
-                                        let t = resolve_path(&r, k, m, prefix, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n));
-                                        t.and_then(|(k2, m2)| sc.lookup_macro(&r, k, k2, m2, last))
+                                        let t = sc.import_module(&r, k, m, prefix);
+                                        t.and_then(|(k2, m2)| sc.lookup_macro(&r, k, m, k2, m2, last))
                                     }
                                     None => None,
                                 };
                                 macro_waited = scope_take_wait();
-                                if let Some(d) = d.filter(|_| !macro_waited) {
-                                    sc.mnon.entry(m.clone()).or_default().insert(b.clone(), d);
-                                    changed = true;
+                                if let Some((d, src_vis)) = d.filter(|_| !macro_waited) {
+                                    let vis = import_vis.min(src_vis);
+                                    let bindings = sc.mnon.entry(m.clone()).or_default();
+                                    if bindings.get(b).is_none_or(|(old, v)| std::sync::Arc::ptr_eq(old, &d) && vis.is_wider_than(*v)) {
+                                        bindings.insert(b.clone(), (d, vis));
+                                        rev[mi] += 1;
+                                        changed = true;
+                                    }
                                 }
                             }
                             if type_waited || macro_waited {
@@ -1447,7 +1551,7 @@ impl CrateScope {
                             }
                         }
                         None => {
-                            let t = resolve_path(&r, k, m, &u.path, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|(a, b)| (a.to_string(), b.to_string()));
+                            let t = sc.import_module(&r, k, m, &u.path).map(|(a, b)| (a.to_string(), b.to_string()));
                             if scope_take_wait() {
                                 waited = true;
                                 waits += 1;
@@ -1459,35 +1563,31 @@ impl CrateScope {
                             }
                             // another crate's module: final, copied once
                             if k2 != k {
-                                settled.insert((m.clone(), ui));
+                                settled.insert((mi, ui));
                             }
-                            let size = sc.size_of(&r, k, &k2, &m2);
-                            if copied.get(&(m.clone(), ui)) == Some(&size) {
-                                continue;
-                            }
-                            // the source's modules: searched through it on demand
+                            let src_rev = mod_index.get(m2.as_str()).map_or(0, |&j| rev[j]);
                             let srcs = sc.tglobs.entry(m.clone()).or_default();
                             match srcs.iter_mut().find(|x| x.0 == k2 && x.1 == m2) {
-                                // (a `pub` glob of a source already imported privately re-exports it)
-                                Some(x) => if u.is_pub && !x.2 { x.2 = true; changed = true; },
-                                None => {
-                                    srcs.push((k2.clone(), m2.clone(), u.is_pub));
-                                    changed = true;
-                                }
+                                Some(x) if import_vis.is_wider_than(x.2) => { x.2 = import_vis; changed = true; }
+                                Some(_) => {}
+                                None => { srcs.push((k2.clone(), m2.clone(), import_vis)); changed = true; }
                             }
-                            // its macros, under the names it has (copied again next pass while some wait)
-                            let macros = sc.all_macros_of(&r, k, &k2, &m2);
+                            if k2 == k && copied.get(&(mi, ui)) == Some(&src_rev) { continue; }
+                            let macros = sc.all_macros_of(&r, k, m, &k2, &m2);
                             if scope_take_wait() {
                                 waited = true;
                                 waits += 1;
-                            } else {
-                                copied.insert((m.clone(), ui), size);
+                            } else if k == k2 {
+                                copied.insert((mi, ui), src_rev);
                             }
                             copies += macros.len();
-                            for (n, v) in macros {
-                                let has = sc.mnon.get(m).map_or(false, |t| t.contains_key(&n)) || sc.mglob.get(m).map_or(false, |t| t.contains_key(&n));
-                                if !has {
-                                    sc.mglob.entry(m.clone()).or_default().insert(n, v);
+                            for (name, d, src_vis) in macros {
+                                if sc.mnon.get(m).is_some_and(|t| t.contains_key(&name)) { continue; }
+                                let vis = import_vis.min(src_vis);
+                                let bindings = sc.mglob.entry(m.clone()).or_default();
+                                if bindings.get(&name).is_none_or(|(_, old)| vis.is_wider_than(*old)) {
+                                    bindings.insert(name, (d, vis));
+                                    rev[mi] += 1;
                                     changed = true;
                                 }
                             }
@@ -1524,59 +1624,66 @@ impl CrateScope {
         sc
     }
 
-    /// The module a name denotes in module `mm` of crate `kk`: this crate's partial tables, a
-    /// dependency's finished ones.
-    fn lookup_type<'b>(&'b self, r: &Res<'b>, k: &str, kk: &'b str, mm: &'b str, n: &str) -> Option<(&'b str, &'b str)> {
-        // Retain the importing crate across qualified paths. A private module
-        // beside a public macro (zerovec::zerovec) must not be imported into the
-        // type namespace and shadow the extern crate used by attribute macros.
-        r.type_in_seen(k, kk, mm, n, &mut Seen::new(), Some((k, self)))
-    }
-
-    fn lookup_macro(&self, r: &Res, k: &str, kk: &str, mm: &str, n: &str) -> Option<MacroRef> {
-        if kk == k {
-            if let Some(d) = self.mnon.get(mm).and_then(|t| t.get(n)) {
-                return Some(d.clone());
-            }
-            if scope_waits(k, mm, n, false) {
-                return None;
-            }
-            return self.mglob.get(mm).and_then(|t| t.get(n)).cloned();
-        }
-        r.macro_in(kk, mm, n)
-    }
-
-    /// How many names module `mm` of crate `kk` has so far.
-    fn size_of(&self, r: &Res, k: &str, kk: &str, mm: &str) -> usize {
-        let sc: &CrateScope = if kk == k {
-            self
-        } else {
-            match r.scope(kk) {
-                Some(s) => s,
-                None => return 0,
-            }
-        };
-        sc.mnon.get(mm).map_or(0, |t| t.len()) + sc.mglob.get(mm).map_or(0, |t| t.len())
-    }
-
-    /// Every macro name module `mm` of crate `kk` has (for a glob import); in the crate being
-    /// computed, not the glob-given names a single import of `mm` may still bind (`scope_waits`).
-    fn all_macros_of(&self, r: &Res, k: &str, kk: &str, mm: &str) -> Vec<(String, MacroRef)> {
-        let sc: &CrateScope = if kk == k {
-            self
-        } else {
-            match r.scope(kk) {
-                Some(s) => s,
-                None => return Vec::new(),
-            }
-        };
-        let mut macros = Vec::new();
-        for (glob, t) in [(false, sc.mnon.get(mm)), (true, sc.mglob.get(mm))] {
-            for (n, v) in t.into_iter().flatten() {
-                if glob && kk == k && !sc.mnon.get(mm).is_some_and(|t| t.contains_key(n)) && scope_waits(k, mm, n, false) {
-                    continue;
+    fn resolve_use_vis(&self, r: &Res, k: &str, root: &str, m: &str, vis: &UseVis) -> ScopeVis {
+        if let Some(v) = vis.ancestor(root, m) { return v; }
+        if let UseVis::In(path) = vis {
+            if let Some((tk, tm)) = self.import_module(r, k, m, path) {
+                if tk == k {
+                    if let Some(v) = ScopeVis::in_ancestor(m, tm) { return v; }
                 }
-                macros.push((n.clone(), v.clone()));
+            }
+        }
+        ScopeVis::private(m)
+    }
+
+    fn lookup_type<'b>(&'b self, r: &Res<'b>, k: &str, m: &str, kk: &'b str, mm: &'b str, n: &str)
+        -> Option<(&'b str, &'b str, ScopeVis)> {
+        r.type_in_seen(kk, mm, n, (kk == k).then_some(m), Some((k, self)))
+    }
+
+    fn import_module<'b>(&'b self, r: &Res<'b>, k: &'b str, m: &'b str, path: &'b [String]) -> Option<(&'b str, &'b str)> {
+        resolve_path(r, k, m, path, &|kk, mm, n| self.lookup_type(r, k, m, kk, mm, n).map(|(a, b, _)| (a, b)))
+    }
+
+    /// Only the leaf contributes its visibility. A public item can be exported
+    /// through an intermediate module private to its importer.
+    fn import_type<'b>(&'b self, r: &Res<'b>, k: &'b str, m: &'b str, path: &'b [String]) -> Option<(&'b str, &'b str, ScopeVis)> {
+        let (last, prefix) = path.split_last()?;
+        if matches!(last.as_str(), "crate" | "self" | "super") || last.starts_with("__relax_crate_") {
+            return self.import_module(r, k, m, path).map(|(a, b)| (a, b, ScopeVis::PUB));
+        }
+        if prefix.is_empty() {
+            return self.lookup_type(r, k, m, k, m, last)
+                .or_else(|| r.extern_crate(k, last).map(|(a, b)| (a, b, ScopeVis::PUB)));
+        }
+        if prefix.len() == 1 && prefix[0].is_empty() {
+            if let Some((a, b)) = r.extern_crate(k, last) { return Some((a, b, ScopeVis::PUB)); }
+        }
+        let (tk, tm) = self.import_module(r, k, m, prefix)?;
+        self.lookup_type(r, k, m, tk, tm, last)
+    }
+
+    fn lookup_macro(&self, r: &Res, k: &str, asker: &str, kk: &str, mm: &str, n: &str) -> Option<(MacroRef, ScopeVis)> {
+        if kk != k { return r.macro_in_vis(k, Some(asker), kk, mm, n); }
+        self.mnon.get(mm).and_then(|t| t.get(n)).or_else(|| {
+            if scope_waits_req(k, mm, n, false, Some(asker)) { return None; }
+            self.mglob.get(mm)?.get(n)
+        }).filter(|(_, v)| v.visible_to(kk, mm, k, asker)).cloned()
+    }
+
+    fn all_macros_of(&self, r: &Res, k: &str, asker: &str, kk: &str, mm: &str) -> Vec<(String, MacroRef, ScopeVis)> {
+        let sc = if kk == k { self } else {
+            let Some(sc) = r.scope(kk) else { return Vec::new(); };
+            sc
+        };
+        let singles = sc.mnon.get(mm);
+        let mut macros = Vec::new();
+        for (glob, bindings) in [(false, singles), (true, sc.mglob.get(mm))] {
+            for (name, (d, vis)) in bindings.into_iter().flatten() {
+                if !vis.visible_to(kk, mm, k, asker) { continue; }
+                if glob && (singles.is_some_and(|t| t.contains_key(name))
+                    || (kk == k && scope_waits_req(k, mm, name, false, Some(asker)))) { continue; }
+                macros.push((name.clone(), d.clone(), *vis));
             }
         }
         macros
@@ -1599,7 +1706,7 @@ struct ScopeRun {
     mods: Vec<String>,
     /// name -> the single imports binding it: (module index, use index, may bind a module, may bind
     /// a macro, `pub`)
-    single: HashMap<String, Vec<(usize, usize, bool, bool, bool)>>,
+    single: HashMap<String, Vec<(usize, usize, bool, bool, ScopeVis)>>,
     current: (usize, usize),
     block: bool,
     waited: bool,
@@ -1608,13 +1715,13 @@ struct ScopeRun {
 
 impl ScopeRun {
     fn new(table: &MacroTable, k: &str, mods: &[String], cm: &CrateMods) -> ScopeRun {
-        let mut single: HashMap<String, Vec<(usize, usize, bool, bool, bool)>> = HashMap::default();
+        let mut single: HashMap<String, Vec<(usize, usize, bool, bool, ScopeVis)>> = HashMap::default();
         for (mi, m) in mods.iter().enumerate() {
             for (ui, u) in cm.uses.get(m).map_or(&[][..], |v| &v[..]).iter().enumerate() {
                 let Some(b) = &u.bind else { continue };
                 let (may_type, may_macro) = use_may_bind(table, u);
                 if may_type || may_macro {
-                    single.entry(b.clone()).or_default().push((mi, ui, may_type, may_macro, u.is_pub));
+                    single.entry(b.clone()).or_default().push((mi, ui, may_type, may_macro, u.vis.resolve(&cm.root, m)));
                 }
             }
         }
@@ -1652,23 +1759,13 @@ fn scope_take_wait() -> bool {
     SCOPE_RUN.with(|c| c.borrow_mut().as_mut().is_some_and(|run| std::mem::take(&mut run.waited)))
 }
 
-/// Whether the module of the import being tried is module `m` or inside it.
-fn scope_asker_inside(m: &str) -> bool {
-    SCOPE_RUN.with(|c| {
-        c.borrow().as_ref().map_or(true, |run| {
-            let asker = run.mods.get(run.current.0).map_or("", |x| x.as_str());
-            asker == m || asker.strip_prefix(m).is_some_and(|r| r.starts_with("::"))
-        })
-    })
-}
-
 /// Whether name `n` of module `m` of crate `k`, missed by the module's own bindings of that
 /// namespace (`type_ns`: modules and crates, else macros), waits: crate `k`'s scope is being
 /// computed and a single import of `m` other than the one being tried may still bind it -- one
 /// visible from the module of the one being tried (`pub`, or that module is inside `m`) whose
 /// failure is not determined (rustc ident.rs: undetermined while such an import may still define
 /// the name). Marks the try waited.
-fn scope_waits(k: &str, m: &str, n: &str, type_ns: bool) -> bool {
+fn scope_waits_req(k: &str, m: &str, n: &str, type_ns: bool, req: Option<&str>) -> bool {
     SCOPE_RUN.with(|c| {
         let mut c = c.borrow_mut();
         let Some(run) = c.as_mut() else { return false };
@@ -1679,10 +1776,9 @@ fn scope_waits(k: &str, m: &str, n: &str, type_ns: bool) -> bool {
         if run.krate != k {
             return false;
         }
-        let asker = run.mods.get(run.current.0).map_or("", |x| x.as_str());
-        let inside = asker == m || asker.strip_prefix(m).is_some_and(|r| r.starts_with("::"));
-        let waits = v.iter().any(|&(mi, ui, may_type, may_macro, is_pub)| {
-            run.mods[mi] == m && (mi, ui) != run.current && (if type_ns { may_type } else { may_macro }) && (is_pub || inside) && !run.failed.contains(&(mi, ui))
+        let waits = v.iter().any(|&(mi, ui, may_type, may_macro, vis)| {
+            run.mods[mi] == m && (mi, ui) != run.current && (if type_ns { may_type } else { may_macro })
+                && vis.visible_to_req(k, m, k, req) && !run.failed.contains(&(mi, ui))
         });
         if waits {
             run.waited = true;
@@ -2043,15 +2139,15 @@ impl MacroScope {
         None
     }
 
-    pub(crate) fn attr_path(&self, cur: &str, module: &str, path: &[String], seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<crate::macro_reg::Entry> {
+    pub(crate) fn attr_path(&self, cur: &str, module: &str, path: &[String], seen: &mut MacroWalkSeen) -> Option<crate::macro_reg::Entry> {
         self.proc_macro_path(cur, module, path, crate::macro_reg::Kind::Attr, seen)
     }
 
-    pub(crate) fn proc_macro_path(&self, cur: &str, module: &str, path: &[String], kind: crate::macro_reg::Kind, seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<crate::macro_reg::Entry> {
+    pub(crate) fn proc_macro_path(&self, cur: &str, module: &str, path: &[String], kind: crate::macro_reg::Kind, seen: &mut MacroWalkSeen) -> Option<crate::macro_reg::Entry> {
         let (name, prefix) = path.split_last()?;
         let r = Res { table: &self.table };
         let (k, m) = if prefix.is_empty() { (cur, module) } else { r.resolve_mod(cur, module, prefix)? };
-        self.proc_macro_in(k, m, name, kind, k != cur, seen)
+        self.proc_macro_in(k, m, name, kind, (k == cur).then_some(module), seen)
     }
 
     /// `builtin_macro_path` of a lookup of its own (no walk in progress): the answer reads only
@@ -2087,29 +2183,15 @@ impl MacroScope {
     }
 
     /// Follow standard macro re-exports as well as re-exported library modules.
-    pub(crate) fn builtin_macro_path(&self, cur: &str, module: &str, path: &[String], seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<String> {
+    pub(crate) fn builtin_macro_path(&self, cur: &str, module: &str, path: &[String], seen: &mut MacroWalkSeen) -> Option<String> {
         let (name, prefix) = path.split_last()?;
         let r = Res { table: &self.table };
         let (k, m) = if prefix.is_empty() { (cur, module) } else { r.resolve_mod(cur, module, prefix)? };
-        if !seen.insert((k.into(), m.into(), name.clone())) { return None; }
-        // std's `dbg!` is expanded with the format macros, not listed in BUILTIN_MACROS
-        if matches!(k, "core" | "std" | "alloc") && m == k && (crate::program::BUILTIN_MACROS.contains(&name.as_str()) || (k == "std" && name == "dbg")) {
-            return Some(name.clone());
-        }
-        // the smallvec Relax provides (std/substitutes.txt) has no `macro_rules! smallvec`: its root's
-        // `smallvec!` is the built-in one, through the crate's path as through an import (a smallvec
-        // compiled from its own source defines the macro, and the call resolves to that first)
-        if krate_name(k) == "smallvec" && name == "smallvec" && r.crate_root(k).1 == m {
-            return Some(name.clone());
-        }
-        let uses = self.table.crates.get(k)?.uses.get(m)?;
-        for u in uses.iter().filter(|u| (k == cur || u.is_pub) && u.bind.as_deref() == Some(name)) {
-            if let Some(name) = self.builtin_macro_path(k, m, &u.path, seen) { return Some(name); }
-        }
-        uses.iter().filter(|u| (k == cur || u.is_pub) && u.bind.is_none()).find_map(|u| {
-            let mut path = u.path.clone();
-            path.push(name.clone());
-            self.builtin_macro_path(k, m, &path, seen)
+        r.imported_macro(k, m, name, (k == cur).then_some(module), seen, &|k, m, name| {
+            let standard = matches!(k, "core" | "std" | "alloc") && m == k
+                && (crate::program::BUILTIN_MACROS.contains(&name) || (k == "std" && name == "dbg"));
+            let smallvec = krate_name(k) == "smallvec" && name == "smallvec" && r.crate_root(k).1 == m;
+            (standard || smallvec).then(|| name.to_string())
         })
     }
 
@@ -2126,10 +2208,11 @@ impl MacroScope {
 
     /// Compiler derives are exported by core and re-exported alongside their traits.
     /// Resolve the container and re-exports before recognizing the builtin spelling.
-    pub(crate) fn builtin_derive_path(&self, cur: &str, module: &str, path: &[String], seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> bool {
+    pub(crate) fn builtin_derive_path(&self, cur: &str, module: &str, path: &[String], seen: &mut MacroWalkSeen) -> bool {
         let Some((name, prefix)) = path.split_last() else { return false; };
         let r = Res { table: &self.table };
-        let is_builtin = |k: &str, suffix: &str| {
+        let is_builtin = |k: &str, m: &str, name: &str| {
+            let suffix = m.strip_prefix(k).unwrap_or(m).trim_start_matches("::");
             if !matches!(k, "core" | "std") { return false; }
             let Some(trait_path) = crate::parser::derive::trait_path(name) else { return false; };
             let container = trait_path.rsplit_once("::").map(|(m, _)| m).unwrap_or("");
@@ -2137,43 +2220,21 @@ impl MacroScope {
                 "prelude::v1" | "prelude::rust_2015" | "prelude::rust_2018" | "prelude::rust_2021" | "prelude::rust_2024")
         };
         let Some((k, m)) = (if prefix.is_empty() { Some((cur, module)) } else { r.resolve_mod(cur, module, prefix) }) else { return false; };
-        if !seen.insert((k.into(), m.into(), name.clone())) { return false; }
-        if is_builtin(k, m.strip_prefix(k).unwrap_or(m).trim_start_matches("::")) { return true; }
-        let Some(uses) = self.table.crates.get(k).and_then(|c| c.uses.get(m)) else { return false; };
-        for u in uses.iter().filter(|u| (k == cur || u.is_pub) && u.bind.as_deref() == Some(name)) {
-            if self.builtin_derive_path(k, m, &u.path, seen) { return true; }
-        }
-        uses.iter().filter(|u| (k == cur || u.is_pub) && u.bind.is_none()).any(|u| {
-            let mut path = u.path.clone();
-            path.push(name.clone());
-            self.builtin_derive_path(k, m, &path, seen)
-        })
+        r.imported_macro(k, m, name, (k == cur).then_some(module), seen,
+            &|k, m, name| is_builtin(k, m, name).then_some(())).is_some()
     }
 
     /// The proc macro `name` of `kind` that module `m` of crate `k` binds as another crate sees it:
     /// its crate's own export at its root, or one its `pub use` imports re-export.
     pub(crate) fn public_proc_macro(&self, k: &str, m: &str, name: &str, kind: crate::macro_reg::Kind) -> Option<crate::macro_reg::Entry> {
-        self.proc_macro_in(k, m, name, kind, true, &mut Default::default())
+        self.proc_macro_in(k, m, name, kind, None, &mut Default::default())
     }
 
-    fn proc_macro_in(&self, k: &str, m: &str, name: &str, kind: crate::macro_reg::Kind, public: bool, seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<crate::macro_reg::Entry> {
-        if !seen.insert((k.into(), m.into(), name.into())) { return None; }
+    fn proc_macro_in(&self, k: &str, m: &str, name: &str, kind: crate::macro_reg::Kind, req: Option<&str>, seen: &mut MacroWalkSeen) -> Option<crate::macro_reg::Entry> {
         let r = Res { table: &self.table };
-        if r.crate_root(k).1 == m {
-            if let Some(e) = crate::macro_reg::exported_proc_macro(krate_name(k), name, kind) { return Some(e); }
-        }
-        let uses = self.table.crates.get(k)?.uses.get(m)?;
-        for u in uses.iter().filter(|u| (!public || u.is_pub) && u.bind.as_deref() == Some(name)) {
-            // Same-spelling imports in other namespaces cannot hide either an
-            // explicit or glob-imported macro. Try every binding in this namespace.
-            if let Some(entry) = self.proc_macro_path(k, m, &u.path, kind, seen) { return Some(entry); }
-        }
-        for u in uses.iter().filter(|u| (!public || u.is_pub) && u.bind.is_none()) {
-            let mut path = u.path.clone();
-            path.push(name.into());
-            if let Some(e) = self.proc_macro_path(k, m, &path, kind, seen) { return Some(e); }
-        }
-        None
+        r.imported_macro(k, m, name, req, seen, &|k, m, name| {
+            if r.crate_root(k).1 == m { crate::macro_reg::exported_proc_macro(krate_name(k), name, kind) } else { None }
+        })
     }
 
     /// The names of `names` a `proc_macro_in` walk from module `m` of crate `k` can find a proc macro
@@ -2245,7 +2306,7 @@ impl MacroScope {
         let r = Res { table: &self.table };
         for dep in self.table.macro_use.get(cur)?.iter().rev() {
             let Some((k, m)) = r.extern_crate(cur, dep) else { continue };
-            if let Some(e) = self.proc_macro_in(k, m, name, kind, true, &mut Default::default()) { return Some(e); }
+            if let Some(e) = self.proc_macro_in(k, m, name, kind, None, &mut Default::default()) { return Some(e); }
         }
         None
     }
@@ -2270,6 +2331,8 @@ struct ImportKey {
     krate: Name,
     module: Name,
     name: Name,
+    /// The required visibility inside `krate`; None is a public-only lookup.
+    req: Option<Name>,
 }
 
 #[derive(Clone)]
@@ -2308,8 +2371,8 @@ struct ImportLookup<'a> {
 }
 
 impl ImportLookup<'_> {
-    fn ask(&mut self, ns: ImportNs, k: Name, m: Name, n: Name, parent: Option<usize>) -> Option<ImportValue> {
-        let key = ImportKey { ns, krate: k, module: m, name: n };
+    fn ask(&mut self, ns: ImportNs, k: Name, m: Name, n: Name, req: Option<Name>, parent: Option<usize>) -> Option<ImportValue> {
+        let key = ImportKey { ns, krate: k, module: m, name: n, req };
         if let Some(answer) = self.memo.get(&key) {
             self.inputs.depend(&answer.inputs);
             if answer.local { if let Some(parent) = parent { self.states[parent].local = true; } }
@@ -2336,8 +2399,8 @@ impl ImportLookup<'_> {
         state.value.clone()
     }
 
-    fn module_name(&mut self, k: Name, m: Name, n: Name, parent: Option<usize>) -> Option<(Name, Name)> {
-        match self.ask(ImportNs::Module, k, m, n, parent)? {
+    fn module_name(&mut self, k: Name, m: Name, n: Name, req: Option<Name>, parent: Option<usize>) -> Option<(Name, Name)> {
+        match self.ask(ImportNs::Module, k, m, n, req, parent)? {
             ImportValue::Module(k, m) => Some((k, m)),
             ImportValue::Macro(_) => unreachable!(),
         }
@@ -2364,7 +2427,7 @@ impl ImportLookup<'_> {
                 let at = if let Some(defining) = first.strip_prefix("__relax_crate_") {
                     ids(r.crate_root(defining))
                 } else {
-                    self.module_name(k, m, path[0], parent).or_else(|| r.extern_crate(ks, first).map(ids))?
+                    self.module_name(k, m, path[0], Some(m), parent).or_else(|| r.extern_crate(ks, first).map(ids))?
                 };
                 (at, &path[1..])
             }
@@ -2373,13 +2436,13 @@ impl ImportLookup<'_> {
             at = match names.str(n) {
                 "self" => at,
                 "super" => (at.0, names.id(names.str(at.1).rsplit_once("::")?.0)),
-                _ => self.module_name(at.0, at.1, n, parent)?,
+                _ => self.module_name(at.0, at.1, n, (at.0 == k).then_some(m), parent)?,
             };
         }
         Some(at)
     }
 
-    fn binding(&mut self, k: Name, m: Name, n: Name) -> Option<Vec<Name>> {
+    fn binding(&mut self, k: Name, m: Name, n: Name, req: Option<&str>) -> Option<Vec<Name>> {
         let key = (m, n);
         let scope = self.scope;
         let mine = scope.local_uses.borrow();
@@ -2390,11 +2453,14 @@ impl ImportLookup<'_> {
         let (ks, ms, ns) = (names.str(k), names.str(m), names.str(n));
         let ids = |path: &Vec<String>| path.iter().map(|s| names.id(s)).collect::<Vec<Name>>();
         table.exp_uses.get(ks).and_then(|u| u.get(&(ms.to_string(), ns.to_string()))).map(ids)
-            .or_else(|| table.crates.get(ks)?.uses.get(ms)?.iter().rev()
-                .find(|u| u.bind.as_deref() == Some(ns)).map(|u| ids(&u.path)))
+            .or_else(|| {
+                let cm = table.crates.get(ks)?;
+                cm.uses.get(ms)?.iter().rev().find(|u| u.bind.as_deref() == Some(ns)
+                    && u.vis.resolve(&cm.root, ms).visible_to_req(ks, ms, ks, req)).map(|u| ids(&u.path))
+            })
     }
 
-    fn globs(&mut self, k: Name, m: Name) -> Vec<Vec<Name>> {
+    fn globs(&mut self, k: Name, m: Name, req: Option<&str>) -> Vec<Vec<Name>> {
         let key = (m, GLOB_ID);
         let scope = self.scope;
         let mine = scope.local_uses.borrow();
@@ -2408,8 +2474,9 @@ impl ImportLookup<'_> {
         if let Some(paths) = table.exp_uses.get(ks).and_then(|u| u.get(&(ms.to_string(), GLOB.to_string()))) {
             add_globs_ids(&mut out, &ids(paths));
         }
-        if let Some(uses) = table.crates.get(ks).and_then(|c| c.uses.get(ms)) {
-            for u in uses.iter().filter(|u| u.bind.is_none()) {
+        if let Some(cm) = table.crates.get(ks) {
+            for u in cm.uses.get(ms).into_iter().flatten().filter(|u| u.bind.is_none()
+                && u.vis.resolve(&cm.root, ms).visible_to_req(ks, ms, ks, req)) {
                 let path = ids(&u.path);
                 if !out.contains(&path) { out.push(path); }
             }
@@ -2428,15 +2495,24 @@ impl ImportLookup<'_> {
     }
 
     fn step(&mut self, i: usize) -> Option<ImportValue> {
-        let ImportKey { ns, krate: k, module: m, name: n } = self.states[i].key;
+        let ImportKey { ns, krate: k, module: m, name: n, req } = self.states[i].key;
         let scope = self.scope;
         let table = &scope.table;
         let names = &*table.names;
         let (ks, ms, nm) = (names.str(k), names.str(m), names.str(n));
         let r = Res { table };
+        let req = req.map(|n| names.str(n));
+        let next = |target| next_req(ks, ms, names.str(target), req).map(|m| names.id(m));
+        if let Some(sc) = r.scope(ks) {
+            let direct = match ns {
+                ImportNs::Module => sc.tnon.get(ms).and_then(|t| t.get(nm)).map(|t| t.2),
+                ImportNs::Macro => sc.mnon.get(ms).and_then(|t| t.get(nm)).map(|t| t.1),
+            };
+            if direct.is_some_and(|v| !v.visible_to_req(ks, ms, ks, req)) { return None; }
+        }
         match ns {
             ImportNs::Module => {
-                if let Some((k2, m2)) = r.type_in(ks, ms, nm) { return Some(ImportValue::Module(names.id(k2), names.id(m2))); }
+                if let Some((k2, m2)) = r.type_in_as(ks, req, ks, ms, nm) { return Some(ImportValue::Module(names.id(k2), names.id(m2))); }
                 let child = names.id(&format!("{ms}::{nm}"));
                 if self.generated_module(k, child) { return Some(ImportValue::Module(k, child)); }
             }
@@ -2446,19 +2522,19 @@ impl ImportLookup<'_> {
                         return Some(ImportValue::Macro(d.clone()));
                     }
                 }
-                if let Some(d) = r.macro_in(ks, ms, nm) { return Some(ImportValue::Macro(d)); }
+                if let Some((d, _)) = r.macro_in_vis(ks, req, ks, ms, nm) { return Some(ImportValue::Macro(d)); }
                 if matches!(ks, "std" | "core" | "alloc") {
                     self.inputs.read(table, LookupInput::Definitions(n));
                     if let Some(d) = r.std_prelude(nm) { return Some(ImportValue::Macro(d)); }
                 }
             }
         }
-        if let Some(path) = self.binding(k, m, n) {
+        if let Some(path) = self.binding(k, m, n, req) {
             return match ns {
                 ImportNs::Module => self.path(k, m, &path, Some(i)).map(|(k, m)| ImportValue::Module(k, m)),
                 ImportNs::Macro => {
                     let (&last, prefix) = path.split_last()?;
-                    if prefix.is_empty() {
+                    if prefix.is_empty() && req.is_some_and(|asker| within(asker, ms)) {
                         self.inputs.read(table, LookupInput::Definitions(last));
                         self.inputs.read(table, LookupInput::Prelude(k));
                         let local = if k == self.origin { &scope.local[..] } else { &[] };
@@ -2467,22 +2543,23 @@ impl ImportLookup<'_> {
                         }
                     }
                     let (k, m) = self.path(k, m, prefix, Some(i))?;
-                    self.ask(ns, k, m, last, Some(i))
+                    self.ask(ns, k, m, last, next(k), Some(i))
                 }
             };
         }
-        for path in self.globs(k, m) {
+        for path in self.globs(k, m, req) {
             if let Some((k, m)) = self.path(k, m, &path, Some(i)) {
-                if let Some(value) = self.ask(ns, k, m, n, Some(i)) { return Some(value); }
+                if let Some(value) = self.ask(ns, k, m, n, next(k), Some(i)) { return Some(value); }
             }
         }
         None
     }
 
     fn lookup(&mut self, name: Name, k: Name, path: &[Name], module: Name) -> Option<MacroRef> {
+        let origin = k;
         let result = loop {
             if let Some((k, m)) = self.path(k, module, path, None) {
-                if let Some(ImportValue::Macro(d)) = self.ask(ImportNs::Macro, k, m, name, None) {
+                if let Some(ImportValue::Macro(d)) = self.ask(ImportNs::Macro, k, m, name, (origin == k).then_some(module), None) {
                     if self.ready.is_empty() { break Some(d); }
                 }
             }
@@ -4534,12 +4611,49 @@ mod replay_tests {
         assert!(scope.finish().replays(&table, "app", "app.rs"));
     }
 
+    #[test]
+    fn glob_visibility_widening_and_shadowing() {
+        let root = "app";
+        let mut cm = CrateMods { root: root.into(), ..Default::default() };
+        for m in ["app", "app::a", "app::b", "app::c", "app::shadow", "app::sibling"] {
+            cm.mods.insert(m.into());
+        }
+        cm.externs.insert("dep".into(), "dep".into());
+        let mut add = |module: &str, prefix: &str, bind: Option<&str>, vis| {
+            cm.add_use(UseItem { module: module.into(), path: prefix.split("::").map(str::to_owned).collect(), bind: bind.map(str::to_owned), vis });
+        };
+        // Sorted module order: b gets a private binding from dep before c
+        // supplies the same binding publicly. a must revisit b after it widens.
+        add("app::a", "crate::b", None, UseVis::Pub);
+        add("app::b", "dep", None, UseVis::Private);
+        add("app::b", "crate::c", None, UseVis::Pub);
+        add("app::c", "dep", None, UseVis::Pub);
+        add("app::shadow", "dep::value", Some("value"), UseVis::Private);
+        add("app::shadow", "dep", None, UseVis::Pub);
+        add("app::sibling", "crate::shadow", None, UseVis::Private);
+        let mut table = macro_table();
+        table.add_crate(root.into(), std::sync::Arc::new(cm));
+        table.push(definition("dep", "one"));
+        let table = std::sync::Arc::new(table);
+        let scope = MacroScope::new(table.clone());
+        let a = ["crate".into(), "a".into()];
+        assert!(table.lookup("value", root, &a, root).is_some(), "downstream glob must receive the wider binding");
+        assert!(table.lookup("value", root, &[], "app::sibling").is_none(), "private single import shadows public glob");
+        assert!(scope.lookup("value", root, &[], "app::sibling").is_none(), "the fallback must also honor shadowing");
+        let restricted = ScopeVis::super_of("app::a::b");
+        assert!(restricted.visible_to(root, "app::a::b", root, "app::a::c"));
+        assert!(!restricted.visible_to(root, "app::a::b", root, "app::ab"));
+        assert!(!restricted.visible_to(root, "app::a::b", "dep", "app::a"));
+        assert_eq!(restricted.min(ScopeVis::PUB), restricted);
+        assert_eq!(common_mod_prefix("app::a::b", "app::ab"), root);
+    }
+
     /// rustc's legacy macro_rules scope: a definition reaches its module after it and the modules
     /// declared after it, and leaves its module only through `#[macro_use]` on the `mod` item.
     #[test]
     fn textual_scope_is_lexical_and_leaves_modules_only_through_macro_use() {
         let mut cm = CrateMods { root: "c".into(), ..Default::default() };
-        let item = |pos, end, macro_use| ModItem { pos, end, macro_use, is_pub: false };
+        let item = |pos, end, macro_use| ModItem { pos, end, macro_use, vis: UseVis::Private };
         // c: macro a (pos 10); mod b { macro b1 (pos 20) } at 30..40 ; #[macro_use] mod m { macro m1 } at 50..60; mod x; at 70..71
         // c::b::inner, c::m::sub (with its own #[macro_use] mod deep { macro d1 } at 15..25)
         for (m, it) in [("c::b", item(30, 40, false)), ("c::m", item(50, 60, true)), ("c::x", item(70, 71, false)),

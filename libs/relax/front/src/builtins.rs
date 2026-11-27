@@ -2239,7 +2239,7 @@ pub(crate) fn scoped_imports(p: &crate::parser::Parser, mut at: usize) -> Option
                     if active {
                         let toks = p.toks.range(i + 1, stop);
                         let text = |k: usize| String::from_utf8_lossy(p.tok_text(toks[k])).trim_start_matches("r#").to_string();
-                        crate::preload::use_tree(&text, &toks, 0, toks.len(), &[], &module, false, &mut uses);
+                        crate::preload::use_tree(&text, &toks, 0, toks.len(), &[], &module, &crate::macros::UseVis::Private, &mut uses);
                     }
                     i = stop + 1;
                 }

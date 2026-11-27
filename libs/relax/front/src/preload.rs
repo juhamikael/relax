@@ -1031,7 +1031,66 @@ fn use_item_end(toks: &[Tok], at: usize) -> Option<usize> {
     None
 }
 
-pub(crate) fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, hi: usize, prefix: &[String], module: &str, is_pub: bool, out: &mut Vec<crate::macros::UseItem>) {
+/// Read the visibility immediately before this item. Block imports have no
+/// visibility outside the enclosing module in the prescan.
+fn scan_vis(src: &[u8], toks: &[Tok], i: usize, module_level: bool) -> crate::macros::UseVis {
+    use crate::macros::UseVis;
+    if !module_level || i == 0 { return UseVis::Private; }
+    match toks[i - 1].kind {
+        T::KwPub => return UseVis::Pub,
+        T::CloseParen => {}
+        _ => return UseVis::Private,
+    }
+    // Visibility paths contain no nested delimiters.
+    let mut open = i - 1;
+    while open > 0 {
+        open -= 1;
+        match toks[open].kind {
+            T::OpenParen => break,
+            T::KwIn | T::KwCrate | T::KwSuper | T::KwSelfValue | T::PathSep | T::Ident | T::RawIdent => {}
+            _ => return UseVis::Private,
+        }
+    }
+    if open == 0 || toks[open - 1].kind != T::KwPub { return UseVis::Private; }
+    let mut inner = &toks[open + 1..i - 1];
+    if inner.first().is_some_and(|t| t.kind == T::KwIn) {
+        inner = &inner[1..];
+    } else if inner.len() != 1 {
+        return UseVis::Private;
+    } else {
+        return match inner[0].kind {
+            T::KwCrate => UseVis::Crate,
+            T::KwSuper => UseVis::Super,
+            _ => UseVis::Private,
+        };
+    }
+    if let [one] = inner {
+        match one.kind {
+            T::KwCrate => return UseVis::Crate,
+            T::KwSuper => return UseVis::Super,
+            T::KwSelfValue => return UseVis::Private,
+            _ => {}
+        }
+    }
+    let mut path = Vec::new();
+    if inner.first().is_some_and(|t| t.kind == T::PathSep) {
+        path.push(String::new());
+        inner = &inner[1..];
+    }
+    if inner.is_empty() || inner.len() % 2 == 0 { return UseVis::Private; }
+    for (j, t) in inner.iter().enumerate() {
+        if j % 2 == 1 {
+            if t.kind != T::PathSep { return UseVis::Private; }
+        } else if matches!(t.kind, T::Ident | T::RawIdent | T::KwCrate | T::KwSuper | T::KwSelfValue) {
+            path.push(String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).trim_start_matches("r#").to_string());
+        } else {
+            return UseVis::Private;
+        }
+    }
+    UseVis::In(path)
+}
+
+pub(crate) fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, hi: usize, prefix: &[String], module: &str, vis: &crate::macros::UseVis, out: &mut Vec<crate::macros::UseItem>) {
     let mut path: Vec<String> = prefix.to_vec();
     let mut i = lo;
     if i < hi && toks[i].kind == T::PathSep && prefix.is_empty() {
@@ -1052,14 +1111,14 @@ pub(crate) fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, 
                             d -= 1;
                             if d == 0 {
                                 if k > s {
-                                    use_tree(text, toks, s, k, &path, module, is_pub, out);
+                                    use_tree(text, toks, s, k, &path, module, vis, out);
                                 }
                                 break;
                             }
                         }
                         T::Comma if d == 1 => {
                             if k > s {
-                                use_tree(text, toks, s, k, &path, module, is_pub, out);
+                                use_tree(text, toks, s, k, &path, module, vis, out);
                             }
                             s = k + 1;
                         }
@@ -1070,7 +1129,7 @@ pub(crate) fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, 
                 return;
             }
             T::Star => {
-                out.push(crate::macros::UseItem { module: module.to_string(), path, bind: None, is_pub });
+                out.push(crate::macros::UseItem { module: module.to_string(), path, bind: None, vis: vis.clone() });
                 return;
             }
             T::PathSep => i += 1,
@@ -1083,7 +1142,7 @@ pub(crate) fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, 
                         if b != "_" && !path.is_empty() {
                             let last = path.last().cloned().unwrap_or_default();
                             let p = if last == "self" { path[..path.len() - 1].to_vec() } else { path.clone() };
-                            out.push(crate::macros::UseItem { module: module.to_string(), path: p, bind: Some(b), is_pub });
+                            out.push(crate::macros::UseItem { module: module.to_string(), path: p, bind: Some(b), vis: vis.clone() });
                         }
                     }
                     return;
@@ -1098,10 +1157,10 @@ pub(crate) fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, 
         if last == "self" {
             if path.len() >= 2 {
                 let b = path[path.len() - 2].clone();
-                out.push(crate::macros::UseItem { module: module.to_string(), path: path[..path.len() - 1].to_vec(), bind: Some(b), is_pub });
+                out.push(crate::macros::UseItem { module: module.to_string(), path: path[..path.len() - 1].to_vec(), bind: Some(b), vis: vis.clone() });
             }
         } else if !last.is_empty() {
-            out.push(crate::macros::UseItem { module: module.to_string(), path, bind: Some(last), is_pub });
+            out.push(crate::macros::UseItem { module: module.to_string(), path, bind: Some(last), vis: vis.clone() });
         }
     }
 }
@@ -1342,10 +1401,10 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                     // rustc; macro calls inside that body see it -- the module's lookups also do
                     // here, which only matters if another module-level binding shadows it)
                     if attrs.active && dirs.last().map_or(true, |l| l.3) {
-                        let is_pub = i >= 1 && (toks[i - 1].kind == T::KwPub || toks[i - 1].kind == T::CloseParen);
+                        let vis = scan_vis(&src, &toks, i, depth == dirs.last().unwrap().0);
                         let module = dirs.last().unwrap().2.clone();
                         let tx = |k: usize| String::from_utf8_lossy(text(k)).trim_start_matches("r#").to_string();
-                        use_tree(&tx, &toks, i + 1, j, &[], &module, is_pub, &mut uses);
+                        use_tree(&tx, &toks, i + 1, j, &[], &module, &vis, &mut uses);
                     }
                     if attrs.active && dirs.last().map_or(true, |l| l.3) {
                         let mut f = i + 1;
@@ -1392,15 +1451,15 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                         let bind = if i + 4 < toks.len() && text(i + 3) == b"as" { String::from_utf8_lossy(text(i + 4)).trim_start_matches("r#").to_string() } else { n.clone() };
                         if n != "self" && bind != "_" {
                             let module = dirs.last().unwrap().2.clone();
-                            let is_pub = i >= 1 && (toks[i - 1].kind == T::KwPub || toks[i - 1].kind == T::CloseParen);
-                            uses.push(crate::macros::UseItem { module, path: vec![String::new(), n.clone()], bind: Some(bind), is_pub });
+                            let vis = scan_vis(&src, &toks, i, depth == dirs.last().unwrap().0);
+                            uses.push(crate::macros::UseItem { module, path: vec![String::new(), n.clone()], bind: Some(bind), vis });
                         } else if n == "self" && bind != "self" && bind != "_" {
                             // `extern crate self as name;` (makepad-draw): the crate under another
                             // name -- bound in the module, and at the root in the extern prelude
                             // (the collector below adds it, UseItem path ["crate"])
                             let module = dirs.last().unwrap().2.clone();
-                            let is_pub = i >= 1 && (toks[i - 1].kind == T::KwPub || toks[i - 1].kind == T::CloseParen);
-                            uses.push(crate::macros::UseItem { module, path: vec!["crate".to_string()], bind: Some(bind), is_pub });
+                            let vis = scan_vis(&src, &toks, i, depth == dirs.last().unwrap().0);
+                            uses.push(crate::macros::UseItem { module, path: vec!["crate".to_string()], bind: Some(bind), vis });
                         }
                     }
                     if attrs.active && dirs.last().map_or(true, |l| l.3) && attrs.macro_use {
@@ -1420,8 +1479,8 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                     let active = attrs.active;
                     let pa = attrs.path;
                     if cur_active && active {
-                        let is_pub = i >= 1 && toks[i - 1].kind == T::KwPub;
-                        mod_items.push((child_path.clone(), crate::macros::ModItem { pos: toks[i].lo, end: toks[i + 2].hi, macro_use: attrs.macro_use, is_pub }));
+                        let vis = scan_vis(&src, &toks, i, depth == dirs.last().unwrap().0);
+                        mod_items.push((child_path.clone(), crate::macros::ModItem { pos: toks[i].lo, end: toks[i + 2].hi, macro_use: attrs.macro_use, vis }));
                     }
                     if toks[i + 2].kind == T::Semi {
                         if cur_active && active {
@@ -1870,6 +1929,78 @@ mod cold_tests {
 
     /// Feed the same source to rustc and the real prescan/outline pipeline. rustc only
     /// compiles fixture libraries; none of their code is launched.
+    fn scan_macro_test_crate(table: &mut MacroTable, cfg: &CfgSet, name: &str, path: &str, source: &str, deps: &[&str]) {
+        let context = crate::source_context::Context::new(path, Default::default(), &cfg.session);
+        let scan = scan_text_mode(path, ".", name, name, 2021, cfg, source.as_bytes().to_vec().into(), &context, true).unwrap();
+        let mut mods = crate::macros::CrateMods { root: name.into(), src: path.into(), ..Default::default() };
+        mods.externs.extend(deps.iter().map(|dep| (dep.to_string(), dep.to_string())));
+        mods.mods.extend(scan.mods);
+        mods.items.extend(scan.mod_items);
+        mods.inner_macro_use.extend(scan.inner_macro_use);
+        for u in scan.uses { mods.add_use(u); }
+        for def in scan.defs { table.define(def); }
+        table.add_crate(name.into(), Arc::new(mods));
+    }
+
+    #[test]
+    fn cross_crate_macro_glob_visibility_matches_rustc() {
+        let dir = std::env::temp_dir().join(format!("relax-glob-vis-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(dir.clone());
+        let dep = r#"
+            #[macro_export] macro_rules! m { () => {} }
+            pub mod via_pub { pub use crate::*; }
+            pub mod via_priv_helper { pub use self::hidden::*; mod hidden { pub use crate::m; } }
+            pub mod via_crate { pub(crate) use crate::*; pub fn keep() { m!(); } }
+            pub mod via_priv { use crate::*; pub fn keep() { m!(); } }
+            pub mod via_pub_over_crate { pub use super::via_crate::*; }
+            pub mod via_crate_mod { pub(crate) mod inner { pub use crate::m; } pub fn keep() { inner::m!(); } }
+        "#;
+        let cfg = CfgSet::host(&Arc::new(crate::Session::default()), &[]);
+        let dep_path = dir.join("dep.rs");
+        std::fs::write(&dep_path, dep).unwrap();
+        let output = std::process::Command::new("rustc").args(["--edition=2021", "--crate-type=rlib"])
+            .arg(&dep_path).arg("--out-dir").arg(&dir).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let mut base = MacroTable::default();
+        scan_macro_test_crate(&mut base, &cfg, "dep", dep_path.to_str().unwrap(), dep, &[]);
+        base.seal_crate("dep");
+
+        let app = dir.join("app.rs");
+        for (module, inner, legal) in [("via_pub", false, true), ("via_priv_helper", false, true),
+            ("via_crate", false, false), ("via_priv", false, false), ("via_pub_over_crate", false, false),
+            ("via_crate_mod", true, false)] {
+            let leaf = if inner { "inner::m" } else { "m" };
+            let source = format!("use dep::{module}::*; pub fn call() {{ {leaf}!(); dep::{module}::{leaf}!(); }}");
+            std::fs::write(&app, &source).unwrap();
+            let output = std::process::Command::new("rustc").args(["--edition=2021", "--crate-type=rlib", "--emit=metadata"])
+                .arg(&app).arg("--out-dir").arg(&dir).arg("--extern").arg(format!("dep={}", dir.join("libdep.rlib").display()))
+                .output().unwrap();
+            let errors = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), legal, "{module}: {errors}");
+            if !legal {
+                assert!(errors.contains(if inner { "E0433" } else { "cannot find macro `m`" }), "{module}: {errors}");
+            }
+            let mut table = base.clone();
+            scan_macro_test_crate(&mut table, &cfg, "app", app.to_str().unwrap(), &source, &["dep"]);
+            let table = Arc::new(table);
+            let scope = crate::macros::MacroScope::new(table.clone());
+            let local: Vec<String> = if inner { vec!["inner".into()] } else { vec![] };
+            let mut qualified = vec!["dep".into(), module.into()];
+            qualified.extend(local.iter().cloned());
+            for path in [&local, &qualified] {
+                assert_eq!(table.lookup("m", "app", path, "app").is_some(), legal, "{module} {path:?}: scope table");
+                assert_eq!(scope.lookup("m", "app", path, "app").is_some(), legal, "{module} {path:?}: import fallback");
+                // import_binds reports explicit imports; a macro_export in the root is a definition.
+                if !legal || module == "via_priv_helper" {
+                    assert_eq!(scope.import_binds("app", "app", path, "m"), legal, "{module} {path:?}: alias scope");
+                }
+            }
+        }
+    }
+
     fn check_glob_cycle(sources: &[(&str, &[&str], &str)], modules: &[&str]) {
         let dir = std::env::temp_dir().join(format!("relax-glob-cycle-{}-{}", std::process::id(), crate::clock::wall_ns()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1888,21 +2019,7 @@ mod cold_tests {
             assert!(output.status.success(), "rustc {name}: {}", String::from_utf8_lossy(&output.stderr));
 
             let path = path.to_string_lossy().into_owned();
-            let context = crate::source_context::Context::new(&path, Default::default(), &sess);
-            let scan = scan_text_mode(&path, ".", name, name, 2021, &cfg, source.as_bytes().to_vec().into(), &context, true).unwrap();
-            let mut mods = crate::macros::CrateMods { root: name.into(), src: path.clone(), ..Default::default() };
-            mods.externs.extend(deps.iter().map(|dep| (dep.to_string(), dep.to_string())));
-            mods.mods.extend(scan.mods);
-            mods.items.extend(scan.mod_items);
-            mods.inner_macro_use.extend(scan.inner_macro_use);
-            for u in scan.uses {
-                if let Some(bind) = &u.bind {
-                    if u.path.last() != Some(bind) { mods.renames.insert(bind.clone()); }
-                }
-                mods.uses.entry(u.module.clone()).or_default().push(u);
-            }
-            for def in scan.defs { table.define(def); }
-            table.add_crate(name.into(), Arc::new(mods));
+            scan_macro_test_crate(&mut table, &cfg, name, &path, source, deps);
             let mut toks = Vec::new();
             assert!(crate::lexer::lex(source.as_bytes(), 2021, &mut toks).is_ok());
             let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(name, &path, name, &cfg));

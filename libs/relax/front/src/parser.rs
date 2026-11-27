@@ -1590,7 +1590,7 @@ impl<'a> Parser<'a> {
                     if let Some(stop) = (i + 1..n).find(|&j| self.toks.at(j).kind == T::Semi) {
                         let toks = self.toks.range(i + 1, stop);
                         let text = |k: usize| String::from_utf8_lossy(self.tok_text(toks[k])).trim_start_matches("r#").to_string();
-                        crate::preload::use_tree(&text, &toks, 0, toks.len(), &[], module, false, &mut uses);
+                        crate::preload::use_tree(&text, &toks, 0, toks.len(), &[], module, &crate::macros::UseVis::Private, &mut uses);
                         i = stop;
                     }
                 }
@@ -1610,7 +1610,7 @@ impl<'a> Parser<'a> {
         let key = (module.to_string(), name.to_string(), kind as u8);
         if let Some(&hit) = s.glob_hits.get(&key) { return hit; }
         let hit = self.macros.as_ref().is_some_and(|m| {
-            let globs: Vec<_> = s.globs.iter().map(|path| crate::macros::UseItem { module: module.to_string(), path: path.clone(), bind: None, is_pub: false }).collect();
+            let globs: Vec<_> = s.globs.iter().map(|path| crate::macros::UseItem { module: module.to_string(), path: path.clone(), bind: None, vis: crate::macros::UseVis::Private }).collect();
             m.proc_macro_import(&self.krate, module, &globs, name, kind).is_some()
         });
         s.glob_hits.insert(key, hit);

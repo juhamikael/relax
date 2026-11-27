@@ -46,7 +46,7 @@ impl Codec for DemandPart {
         Some(Self { key: Codec::get(r)?, ..Self::default() })
     }
 }
-const PART_VERSION: u32 = 13;
+const PART_VERSION: u32 = 14;
 const PART_DOMAIN: &str = "demand-part-v12";
 
 type Resolve<'a> = dyn FnMut(&str, u128) -> Option<&'static [u8]> + 'a;
