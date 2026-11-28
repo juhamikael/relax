@@ -155,6 +155,9 @@ fn stored_owner_verdict_absent_epoch_returns_none_without_poisoning() {
             let first = std::thread::scope(|s| s.spawn(|| lookup(&front, epoch)).join());
             u.cache = taken;
             assert_eq!(first.unwrap(), None, "an unpublished epoch has no verdict");
+            // With the cache back, a reader still sees only published verdicts.
+            let present = std::thread::scope(|s| s.spawn(|| lookup(&front, epoch)).join());
+            assert_eq!(present.unwrap(), None, "an unpublished epoch must not fall back to u.cache");
             assert!(!front.owner_verdicts.contains_key(&epoch), "reader published an epoch");
             assert!(!front.stored_owner.contains_key(&(epoch, caller)), "reader memoized an unpublished epoch's miss");
             u.publish_owner_verdicts();
