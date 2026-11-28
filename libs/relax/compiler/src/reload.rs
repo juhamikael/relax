@@ -722,6 +722,7 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Result<Vec<Strin
                 u.tcx.adts.insert(*d, adt.clone());
             }
             publish_reload(u, &undo.versions, undo.full_inputs, undo.scope.as_deref());
+            u.publish_owner_verdicts();
             u.lay.clear();
             u.prog.reclaim_caches();
             drop(fw);
@@ -7139,6 +7140,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     for (d, had) in &saved_variants { u.prog.restore_variants(*d, had); }
                     restore_traits(u, &saved_traits, Some(&visible_crates));
                     u.tcx.publish_collected();
+                    u.publish_owner_verdicts();
                     drop(fw);
                     out.rung = Rung::Restart;
                     out.lines.push(e);
@@ -7394,6 +7396,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
         trace_sub("raw_builders");
+        u.publish_owner_verdicts();
         unsafe {
             u.prog.reclaim_caches();
         }
@@ -8603,6 +8606,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             u.lay.clear();
             out.lines.retain(|l| !l.starts_with("field `"));
         }
+        u.publish_owner_verdicts();
         drop(fw);
         if rekeyed { crate::cache::rekey_after_revert(up); }
         jit::bump_patch_epoch();

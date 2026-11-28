@@ -735,6 +735,14 @@ pub struct CacheStats {
     pub ids_ns: u64,
 }
 
+pub(crate) const OFF_OWNER_CACHE_MSG: &str =
+    "relax: off-owner lowering accessed Unit::cache (violates CacheCell Sync invariant)";
+
+pub(crate) fn is_off_owner_cache_panic(p: &(dyn std::any::Any + Send)) -> bool {
+    p.downcast_ref::<&str>().is_some_and(|s| *s == OFF_OWNER_CACHE_MSG)
+        || p.downcast_ref::<String>().is_some_and(|s| s == OFF_OWNER_CACHE_MSG)
+}
+
 /// Interior storage for the cache installed in a Unit. The owner thread protects
 /// every access. Linker borrows one operation at a time and holds only this cell's
 /// raw pointer across callbacks, which may recursively access the same cell.
@@ -744,7 +752,13 @@ pub struct CacheCell(std::cell::UnsafeCell<Cache>);
 unsafe impl Sync for CacheCell {}
 impl CacheCell {
     pub fn new(cache: Cache) -> Self { Self(std::cell::UnsafeCell::new(cache)) }
-    pub(crate) fn get(&self) -> *mut Cache { self.0.get() }
+    pub(crate) fn get(&self) -> *mut Cache {
+        if cfg!(debug_assertions) && crate::jit::lowering_ahead_active() {
+            eprintln!("{OFF_OWNER_CACHE_MSG}\n{}", std::backtrace::Backtrace::force_capture());
+            panic!("{OFF_OWNER_CACHE_MSG}");
+        }
+        self.0.get()
+    }
     pub(crate) fn into_inner(self) -> Cache { self.0.into_inner() }
 }
 impl std::ops::Deref for CacheCell {
@@ -926,6 +940,9 @@ pub struct Cache {
     /// interface fingerprints (cache/items.rs), per crate index: what code keys name; the bound
     /// crates of this program folded in (items::apply_bound)
     iface: Vec<u128>,
+    /// Interfaces paired with the boot fingerprints for stored owner verdicts. A live edit
+    /// can rekey `iface` until after the front write that publishes the reverted collection.
+    boot_iface: Vec<u128>,
     /// the same without the bound crates: what a collected image stores (run, check and
     /// check --boundary of one program bind different sets, the image is shared by all)
     iface_plain: Vec<u128>,
@@ -1477,6 +1494,7 @@ impl Cache {
             cur_sealed: false,
             cur_shared: false,
             iface: Vec::new(),
+            boot_iface: Vec::new(),
             iface_plain: Vec::new(),
             view: Vec::new(),
             late: Vec::new(),
@@ -1634,6 +1652,7 @@ impl Cache {
         let provided: Vec<(u32, u64)> = from.provided.clone();
         c.bound = provided.clone();
         c.iface = items::apply_bound(prog, &c.iface_plain, &provided);
+        c.boot_iface = c.iface.clone();
         // the views (a restored collected program digests no file: its interfaces are restored)
         let mut view = items::crate_views(prog, &c.iface_plain, &deps::atomic_crates(prog, ncr));
         view.truncate(ncr);
@@ -3935,7 +3954,7 @@ impl Cache {
 
     pub fn owner_verdicts(&self, epoch: u64) -> OwnerVerdicts {
         let store = self.code_path.first().and_then(|p| self.stores.iter().find(|st| st.path == *p)).cloned();
-        OwnerVerdicts::new(self.cfg, self.fps.clone(), self.iface.clone(), epoch, store)
+        OwnerVerdicts::new(self.cfg, self.fps.clone(), self.boot_iface.clone(), epoch, store)
     }
 
     /// borrowck lane: definition `d`'s body in the seen-bodies index (its path and its text,

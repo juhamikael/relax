@@ -776,7 +776,7 @@ fn build_world_once(sess: &std::sync::Arc<crate::Session>, units: &[crate::macro
     // fingerprints): a warm start compiles none of it
     if let Some(mode) = crate::cache::mode_from_env(&u.prog.session.options) {
         if let Ok(c) = crate::cache::Cache::open(&u, mode) {
-            u.cache = Some(Box::new(crate::cache::CacheCell::new(c)));
+            u.set_cache(c);
         }
     }
     let t_cache = t0.elapsed().as_secs_f64() * 1e3;

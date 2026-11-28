@@ -754,6 +754,7 @@ unsafe fn replace(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: cr
     // advance: a restored context counting from its image would put every later epoch behind)
     u.tcx.collect_epoch.fetch_max(checked_epoch, Ordering::SeqCst);
     u.tcx.publish_collected();
+    u.publish_owner_verdicts();
     // the background borrow checker keeps every verdict and queued check (the same program)
     let epoch_to = u.tcx.collect_epoch.load(Ordering::SeqCst);
     crate::borrowck::lazy::carry_whole(u.front.checker_id, checked_epoch, epoch_to);

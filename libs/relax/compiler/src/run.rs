@@ -2483,7 +2483,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             // collected image), whose verdicts are written right after (record_check_front may
             // write nothing); else every check that repeats no passing one checks all of std again.
             let lent = u.cache.is_none() && match boot_cache.take().map(Ok).or_else(|| crate::cache::mode_from_env(options).map(|m| crate::cache::Cache::open_collected(&*u, m, None))) {
-                Some(Ok(c)) => { u.cache = Some(Box::new(crate::cache::CacheCell::new(c))); true }
+                Some(Ok(c)) => { u.set_cache(c); true }
                 Some(Err(e)) => { verbose!("relax check: std's verdicts not looked up: {e}"); false }
                 None => false,
             };
@@ -2684,7 +2684,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 // (build scripts, the proc-macro host) do not make a first run warm
                 unsafe { std::env::set_var("RELAX_CACHE_STATE", if c.has_startup_manifest() { "warm" } else { "cold" }) };
                 crate::first_frame::classified(c.has_startup_manifest());
-                u.cache = Some(Box::new(crate::cache::CacheCell::new(c)));
+                u.set_cache(c);
             }
             Err(e) => verbose!("relax cache: off ({})", e),
         }

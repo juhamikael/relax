@@ -10111,12 +10111,8 @@ impl Unit {
             _ => None,
         };
         self.cache = c;
+        self.publish_owner_verdicts();
         let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-        if let Some(c) = &self.cache {
-            if !self.front.owner_verdicts.contains_key(&epoch) {
-                self.front.owner_verdicts.insert(epoch, std::sync::Arc::new(c.owner_verdicts(epoch)));
-            }
-        }
         let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(self.front.clone()));
         crate::borrowck::lazy::check_before_run(&self.prog, &self.tcx, &src, d, epoch, key, cached)
     }
@@ -10329,12 +10325,7 @@ impl Unit {
             let edited = c.as_mut().is_some_and(|c| c.edited_body(self, d, key, cached.as_ref()));
             let rank = if edited { Some(rank.map_or(crate::borrowck::lazy::RANK_EDITED, |r| r.min(crate::borrowck::lazy::RANK_EDITED))) } else { rank };
             self.cache = c;
-            if let Some(c) = &self.cache {
-                let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                if !self.front.owner_verdicts.contains_key(&epoch) {
-                    self.front.owner_verdicts.insert(epoch, std::sync::Arc::new(c.owner_verdicts(epoch)));
-                }
-            }
+            self.publish_owner_verdicts();
             trace_stored_verdict(&self.prog, d, "instance", cached.as_ref());
             let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(self.front.clone()));
             let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
@@ -10454,6 +10445,23 @@ impl Unit {
         }
     }
 
+    /// Publishes the current collection's verdict source at cache install and before the
+    /// front write that advances the epoch releases its readers.
+    pub(crate) fn publish_owner_verdicts(&mut self) {
+        let Some(c) = self.cache.as_ref() else { return };
+        let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+        if !self.front.owner_verdicts.contains_key(&epoch) {
+            crate::zone_alloc::kept_with(|| {
+                self.front.owner_verdicts.insert_first(epoch, std::sync::Arc::new(c.owner_verdicts(epoch)));
+            });
+        }
+    }
+
+    pub(crate) fn set_cache(&mut self, cache: crate::cache::Cache) {
+        self.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        self.publish_owner_verdicts();
+    }
+
     /// SPEC-V: the verdict an earlier run stored for owner `d` under the current sources (cache.rs
     /// OwnerVerdicts: the crate fingerprints and the definition), if any.
     /// Looked up once per owner and epoch (sweep_verdicts asks again for every waiting slot).
@@ -10461,11 +10469,10 @@ impl Unit {
         if let Some(v) = self.front.stored_owner.get(&(epoch, d)) {
             return v;
         }
-        let c = self.cache.as_ref()?;
-        let v = match self.front.owner_verdicts.get(&epoch) {
-            Some(v) => v,
-            None => crate::zone_alloc::kept_with(|| self.front.owner_verdicts.insert_first(epoch, std::sync::Arc::new(c.owner_verdicts(epoch)))),
-        };
+        #[cfg(test)]
+        stored_owner_verdict_hook();
+        // Leave the per-owner memo empty until the epoch has a published verdict source.
+        let v = self.front.owner_verdicts.get(&epoch)?;
         let found = v.lookup(&self.prog, d, epoch).1;
         crate::zone_alloc::kept_with(|| self.front.stored_owner.insert_first((epoch, d), found))
     }
@@ -17721,6 +17728,7 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
         }
         break defs;
     };
+    u.publish_owner_verdicts();
     let resigned = u.tcx.forget_error_signatures();
     // builds that failed for want of these names (here or on a speculative worker) run again
     for f in u.fns.iter_mut() {
@@ -31774,6 +31782,12 @@ pub(crate) fn lower_ahead_fn_key(id: u32) -> Option<FnKey> {
     LOWER_AHEAD_IDS.with(|a| a.borrow().keys.get((u32::MAX - id) as usize).cloned())
 }
 
+/// Whether the current thread is inside an off-owner lowering pass.
+#[inline]
+pub(crate) fn lowering_ahead_active() -> bool {
+    LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false)
+}
+
 /// FRONT_RW readers must never acquire the unit lock: its owner may be waiting for their
 /// read guard to re-collect types. Abort *before* acquiring it, including when uncontended.
 /// resume_unwind avoids the panic hook; the helper leaves the checked body for a normal build.
@@ -32057,6 +32071,8 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
             if p.is::<crate::preempt::NeedsUnit>() {
                 owner::pure_note(owner::PURE_AHEAD_BAIL);
                 Err(AF_NEEDS_UNIT)
+            } else if crate::cache::is_off_owner_cache_panic(&*p) {
+                std::panic::resume_unwind(p);
             } else {
                 if ahead_trace() {
                     eprintln!("ahead-lower panic: {}", u.prog.def_path(d));
@@ -33572,6 +33588,21 @@ mod inspect_tiers_tests;
 #[cfg(test)]
 #[path = "tier_stuck_tests.rs"]
 mod tier_stuck_tests;
+
+#[cfg(test)]
+static STORED_OWNER_VERDICT_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn stored_owner_verdict_hook() {
+    if owner::is_owner() { return; }
+    let hook = STORED_OWNER_VERDICT_HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(hook) = hook { hook(); }
+}
+
+#[cfg(test)]
+#[path = "cache_race_tests.rs"]
+mod cache_race_tests;
 #[cfg(test)]
 #[path = "code_window_tests.rs"]
 mod code_window_tests;
