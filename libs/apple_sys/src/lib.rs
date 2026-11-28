@@ -1240,6 +1240,7 @@ pub struct MTLClearColor {
 #[allow(non_camel_case_types)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum MTLPixelFormat {
+    Invalid = 0,
     R8Unorm = 10,
     R16Float = 25,
     RG8Unorm = 30,
