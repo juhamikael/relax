@@ -126,6 +126,25 @@ impl Unit {
     }
 }
 
+/// Tests: runs on the owner in `lay_out` right before a section's spans are published, so readers
+/// off the owner can be lined up against that insert burst (static_race_tests.rs).
+#[cfg(test)]
+static SECTIONS_INSERT_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_sections_insert_hook(hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    *SECTIONS_INSERT_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn sections_before_insert_hook() {
+    let hook = SECTIONS_INSERT_HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 /// Lays out output section `group` (once): every static of the program's current files placed
 /// in it, in one block. Their addresses are all recorded before any initializer runs, as for
 /// any static (statics may name each other's addresses).
@@ -204,12 +223,14 @@ fn lay_out(u: &mut Unit, group: &str) -> (u64, u64) {
         }
     }
     crate::zone_alloc::kept_with(|| {
-        for &(d, _, off, len) in &laid {
+        for &(d, _, off, _) in &laid {
             u.statics.insert(d, base + off);
-            u.static_spans.insert(base + off, (d, len));
         }
         u.sections.insert(group.to_string(), Section { start: base, end: base + size, members: laid.iter().map(|m| m.0).collect() });
     });
+    #[cfg(test)]
+    sections_before_insert_hook();
+    u.syms.insert_static_spans(laid.iter().map(|&(d, _, off, len)| (base + off, d, len)));
     for &(d, t, off, len) in &laid {
         u.init_static(d, t, base + off, len);
     }

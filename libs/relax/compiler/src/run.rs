@@ -2891,18 +2891,17 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     jit::ORDER_UNTIL_NS.store(jit::wall_ns() + 5_000_000_000, Ordering::Relaxed);
     // the manifest's slots before the first present: installed now, from its prelinked image
     let t_pre = Instant::now();
-    let prelinked = unsafe { jit::prelink_startup(up) };
-    if prelinked == 0 && warm_start.is_some() {
-        if let Some(c) = unsafe { (*up).cache.as_ref() } {
+    let prelink = unsafe { jit::prelink_startup_report(up) };
+    if prelink.prelinked == 0 && warm_start.is_some() {
+        if let Some(s) = prelink.stats.as_ref() {
             verbose!("relax cache: warm start without a prelinked startup image (image {}, {} stale, {} unresolved, {} had code)",
-                if c.has_startup_image() { "present" } else { "missing" }, c.stats.prelink_changed, c.stats.prelink_failed, c.stats.prelink_had_code);
+                if prelink.has_startup_image { "present" } else { "missing" }, s.prelink_changed, s.prelink_failed, s.prelink_had_code);
         }
     }
-    if prelinked > 0 {
+    if prelink.prelinked > 0 {
         // a warm start: the watcher (started below) takes edits once no demand compile runs
         jit::prelinked_start();
-        if let Some(c) = unsafe { (*up).cache.as_ref() } {
-            let s = &c.stats;
+        if let Some(s) = prelink.stats.as_ref() {
             let ms = |ns: u64| ns as f64 / 1e6;
             verbose!("relax cache: prelinked {} startup slots and {} data objects in {:.1} ms (image read {:.1}, keys {:.1}, symbols {:.1}, placed+linked+installed {:.1}; {} naming a changed crate kept, checked in {:.1}; {} left lazy: {} stale, {} unresolved, {} had code)", s.prelinked, s.prelink_data, t_pre.elapsed().as_secs_f64() * 1e3,
                 ms(s.prelink_parse_ns), ms(s.prelink_keys_ns), ms(s.prelink_syms_ns), ms(s.prelink_ns.saturating_sub(s.prelink_parse_ns + s.prelink_keys_ns + s.prelink_syms_ns + s.prelink_check_ns)),

@@ -384,10 +384,54 @@ pub(crate) mod bmemo;
 #[path = "settle_rebuild.rs"]
 pub(crate) mod settle_rebuild;
 
+pub(crate) const OFF_OWNER_STATICS_MSG: &str =
+    "relax: off-owner reader accessed Unit::statics (owner-only map)";
+
+pub(crate) fn is_off_owner_statics_panic(p: &(dyn std::any::Any + Send)) -> bool {
+    p.downcast_ref::<&str>().is_some_and(|s| *s == OFF_OWNER_STATICS_MSG)
+        || p.downcast_ref::<String>().is_some_and(|s| s == OFF_OWNER_STATICS_MSG)
+}
+
+/// Owner-only storage for `Unit::statics`. Enforces under `debug_assertions` that no off-owner
+/// front reader or lowering-ahead worker touches `Unit::statics` concurrently with owner
+/// mutation (single-threaded tests, `makepad check`, and `makepad serve` hold no front read).
+#[derive(Default)]
+pub struct OwnerStatics(crate::fxhash::HashMap<DefId, u64>);
+
+impl OwnerStatics {
+    #[inline]
+    fn check_access() {
+        if cfg!(debug_assertions)
+            && !owner::is_owner()
+            && (front_reads_held() > 0 || LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false))
+        {
+            eprintln!("{OFF_OWNER_STATICS_MSG}\n{}", std::backtrace::Backtrace::force_capture());
+            panic!("{OFF_OWNER_STATICS_MSG}");
+        }
+    }
+}
+
+impl std::ops::Deref for OwnerStatics {
+    type Target = crate::fxhash::HashMap<DefId, u64>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        Self::check_access();
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OwnerStatics {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Self::check_access();
+        &mut self.0
+    }
+}
 
 /// Heaps (MEMSAFE.DESIGN.md: placement only, never lifetime -- every block is freed by its owner's
 /// Drop). KEPT (system heap, built and grown under `zone_alloc::kept`): the Unit box, code tables,
-/// fns/fn_map, consts, const_readers, body_deps, statics/static_spans, sites/site_ix, rt/rs,
+/// fns/fn_map, consts, const_readers, body_deps, statics, sites/site_ix, rt/rs,
 /// syms, start_order, vtables, locations, lit_data, provided*, slots, missing_stubs, patch_log,
 /// forwards, kept_old/kept_at, tier-1 state, stats, errors and the scalars/addresses. COMPILER arena: prog, tcx, lay, bodies,
 /// old_bodies, coro_*, spec_cached, the unwind/unpin/cycle/core-path memos, const_failed, cache,
@@ -469,7 +513,7 @@ pub struct Unit {
     /// o3_nocapture_facts; also in `body_deps`): a live edit of one builds the reader again
     /// (reload::hosts_of), whose sibling call stood on the answer. Grows as `body_deps` does.
     pub fact_deps: crate::fxhash::HashMap<u32, Vec<u32>>,
-    pub statics: crate::fxhash::HashMap<DefId, u64>,
+    pub statics: OwnerStatics,
     /// Immutable data objects of static initializers that have a cache snapshot.
     rt_static_initials: crate::fxhash::HashMap<DefId, u64>,
     /// the certificates of the constants' and statics' values of this run (ConstCert; by
@@ -478,9 +522,6 @@ pub struct Unit {
     pub const_certs: crate::fxhash::HashMap<(DefId, Vec<TyId>), ConstCert>,
     /// `#[thread_local]` statics: where each thread's copy lives (thread_local_place)
     pub tls_places: crate::fxhash::HashMap<DefId, TlsPlace>,
-    /// the statics' storage by address: start -> (static, size), so a pointer into a static
-    /// (`&S.field`, `&S[3]`) in constant data is that static's symbol plus an offset
-    pub static_spans: std::collections::BTreeMap<u64, (DefId, u64)>,
     /// the link sections laid out so far, by output section (sections.rs)
     pub(crate) sections: crate::fxhash::HashMap<String, crate::sections::Section>,
     pub sites: std::sync::Arc<relax_session::sync::Mutex<Vec<Site>>>,
@@ -2629,47 +2670,58 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
 /// call. Slots whose crates changed, whose identities do not resolve or that have code already
 /// stay lazy. RELAX_PRELINK=0 turns it off. Returns the slots installed.
 pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
+    prelink_startup_report(up).prelinked
+}
+
+/// Startup cache statistics captured by the owner before it posts borrow-check notes.
+#[derive(Default, Clone, Debug)]
+pub struct PrelinkReport {
+    pub prelinked: usize,
+    pub has_startup_image: bool,
+    pub stats: Option<crate::cache::CacheStats>,
+}
+
+pub unsafe fn prelink_startup_report(up: *mut Unit) -> PrelinkReport {
     // (--check-first: every slot passes the borrow checker before its first code, cached or not)
-    if CHECK_FIRST.load(Ordering::Relaxed) || std::env::var_os("RELAX_PRELINK").map_or(false, |v| v == "0") {
-        return 0;
-    }
-    let prelinked = owner::call(owner::Class::Program, || {
-        let usable = (&*up).cache.as_ref().map_or(false, |c| c.mode != crate::cache::Mode::Verify && c.startup_manifest_valid());
-        if !usable {
-            return None;
-        }
-        let options = (&*up).prog.session.clone().options.clone();
-        let gandalf = crate::borrowck::lazy::gandalf_enabled(&options);
+    let enabled = !CHECK_FIRST.load(Ordering::Relaxed)
+        && !std::env::var_os("RELAX_PRELINK").is_some_and(|v| v == "0");
+    let (report, notes) = owner::call(owner::Class::Program, || {
+        let mut n = 0;
         let mut notes = Vec::new();
-        PRELINKED_ORDER[0].store((&*up).start_order.len(), Ordering::Relaxed);
-        let n = crate::cache::prelink_unit(up, &mut |u: &mut Unit, slots: Vec<crate::cache::PrelinkedSlot>| {
-            u.code.write().unwrap_or_else(|e| e.into_inner()).reserve(slots.len());
-            crate::zone_alloc::kept_with(|| u.start_order.reserve(slots.len()));
-            let mut arm = Vec::with_capacity(slots.len());
-            let up: *mut Unit = u;
-            let mut verdicts = Vec::new();
-            let mut twins = Vec::new();
-            for s in slots {
-                if matches!((&*up).fns[s.id as usize].key, FnKey::Plain(_)) {
-                    twins.push((s.id, s.o3));
+        if enabled && (&*up).cache.as_ref().is_some_and(|c| c.mode != crate::cache::Mode::Verify && c.startup_manifest_valid()) {
+            let options = (&*up).prog.session.clone().options.clone();
+            let gandalf = crate::borrowck::lazy::gandalf_enabled(&options);
+            PRELINKED_ORDER[0].store((&*up).start_order.len(), Ordering::Relaxed);
+            n = crate::cache::prelink_unit(up, &mut |u: &mut Unit, slots: Vec<crate::cache::PrelinkedSlot>| {
+                u.code.write().unwrap_or_else(|e| e.into_inner()).reserve(slots.len());
+                crate::zone_alloc::kept_with(|| u.start_order.reserve(slots.len()));
+                let mut arm = Vec::with_capacity(slots.len());
+                let up: *mut Unit = u;
+                let mut verdicts = Vec::new();
+                let mut twins = Vec::new();
+                for s in slots {
+                    if matches!((&*up).fns[s.id as usize].key, FnKey::Plain(_)) {
+                        twins.push((s.id, s.o3));
+                    }
+                    install_prelinked_slot(up, s, gandalf, &mut notes, &mut arm, &mut verdicts);
                 }
-                install_prelinked_slot(up, s, gandalf, &mut notes, &mut arm, &mut verdicts);
-            }
-            // (after the whole image: a twin's base may be in it, later than the twin)
-            for (t, o3) in twins {
-                twin_stored(up, t, o3);
-            }
-            (&mut *up).arm_counters(&arm);
-            // (a call reaches each through its count stub: startup_set_called reads which were called)
-            crate::zone_alloc::kept_with(|| PRELINKED_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).extend(arm.iter().map(|a| a.0)));
-            for (id, v, base) in verdicts {
-                stored_tier_verdict(&*up, id, v, base);
-            }
-        });
-        PRELINKED_ORDER[1].store((&*up).start_order.len(), Ordering::Relaxed);
-        Some((n, notes))
+                // (after the whole image: a twin's base may be in it, later than the twin)
+                for (t, o3) in twins {
+                    twin_stored(up, t, o3);
+                }
+                (&mut *up).arm_counters(&arm);
+                // (a call reaches each through its count stub: startup_set_called reads which were called)
+                crate::zone_alloc::kept_with(|| PRELINKED_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).extend(arm.iter().map(|a| a.0)));
+                for (id, v, base) in verdicts {
+                    stored_tier_verdict(&*up, id, v, base);
+                }
+            });
+            PRELINKED_ORDER[1].store((&*up).start_order.len(), Ordering::Relaxed);
+        }
+        let (has_startup_image, stats) = (&*up).cache.as_ref()
+            .map_or((false, None), |c| (c.has_startup_image(), Some(c.stats.clone())));
+        (PrelinkReport { prelinked: n, has_startup_image, stats }, notes)
     });
-    let Some((n, notes)) = prelinked else { return 0 };
     // the background borrow checker learns of them after the start (each note computes a
     // verdict key: per slot work the start does not wait for)
     if !notes.is_empty() {
@@ -2700,7 +2752,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         });
         }
     }
-    n
+    report
 }
 
 /// O3 jobs that panicked outside their build's recovery (slot left at O1)
@@ -2746,6 +2798,9 @@ pub(crate) fn panic_payload(p: &(dyn std::any::Any + Send)) -> (String, bool) {
 /// An O3 candidate's optimize_tree panicked (off the owner): counted, printed once per slot
 /// (bails only counted), and handed on as a failed build.
 fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Send>) -> Deferred {
+    if is_off_owner_statics_panic(&*p) {
+        std::panic::resume_unwind(p);
+    }
     let (msg, bail) = panic_payload(&*p);
     O3_OPT_PANICS[bail as usize].fetch_add(1, Ordering::Relaxed);
     if !bail && O3_OPT_PANICKED.lock().unwrap().insert(id) {
@@ -6450,7 +6505,6 @@ impl Unit {
             rt_static_initials: Default::default(),
             const_certs: Default::default(),
             tls_places: Default::default(),
-            static_spans: Default::default(),
             sections: Default::default(),
             sites: crate::zone_alloc::kept_with(Default::default),
             site_ix: Default::default(),
@@ -7229,10 +7283,12 @@ impl Unit {
     /// past a static's end may be the next block's start (another static, a writable block a
     /// fn's code owns): such a pointer is not attributed.
     pub fn static_sym_at(&self, addr: u64) -> Option<relax_backend::rir::Sym> {
-        let (&start, &(d, size)) = self.static_spans.range(..=addr).next_back()?;
-        if (addr != start && addr >= start + size) || self.statics.get(&d) != Some(&start) {
+        // Even a zero-sized static reserves a byte in the writable region. Addresses outside
+        // the allocated range skip the span lock.
+        if !self.in_rw(addr, 1) {
             return None;
         }
+        let (start, d, _) = self.syms.static_span_containing(addr)?;
         let mut s = self.syms.intern(crate::syms::SymKind::Static(d), start);
         s.off = (addr - start) as i64;
         Some(s)
@@ -9516,10 +9572,8 @@ impl Unit {
         }
         let l = self.layout_of(t);
         let buf = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
-        crate::zone_alloc::kept_with(|| {
-            self.statics.insert(d, buf);
-            self.static_spans.insert(buf, (d, l.size as u64));
-        });
+        crate::zone_alloc::kept_with(|| self.statics.insert(d, buf));
+        self.syms.insert_static_span(buf, d, l.size as u64);
         self.init_static(d, t, buf, l.size as u64)
     }
 
@@ -9554,6 +9608,7 @@ impl Unit {
                 return buf;
             }
             crate::zone_alloc::kept_with(|| self.statics.insert(d, 0));
+            self.syms.remove_static_span(buf, d);
             return 0;
         } else {
             let cert = ran.map(|r| r.1).expect("ran");
@@ -32071,7 +32126,7 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
             if p.is::<crate::preempt::NeedsUnit>() {
                 owner::pure_note(owner::PURE_AHEAD_BAIL);
                 Err(AF_NEEDS_UNIT)
-            } else if crate::cache::is_off_owner_cache_panic(&*p) {
+            } else if is_off_owner_statics_panic(&*p) || crate::cache::is_off_owner_cache_panic(&*p) {
                 std::panic::resume_unwind(p);
             } else {
                 if ahead_trace() {
@@ -33609,6 +33664,9 @@ mod code_window_tests;
 #[cfg(test)]
 #[path = "trap_fill_tests.rs"]
 mod trap_fill_tests;
+#[cfg(test)]
+#[path = "static_race_tests.rs"]
+mod static_race_tests;
 
 #[cfg(test)]
 mod own_work_tests {
