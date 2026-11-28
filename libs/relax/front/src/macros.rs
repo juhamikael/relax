@@ -2010,6 +2010,7 @@ impl MacroScope {
         v.push(entry);
         self.uses_log.borrow_mut().push((key, v.clone()));
         *self.memo.borrow_mut() = LookupMemo::default();
+        *self.builtin_paths.borrow_mut() = None;
     }
 
     /// A glob import parsed in this module. The same path may have several visibilities.
@@ -2023,6 +2024,7 @@ impl MacroScope {
         v.push(entry);
         self.uses_log.borrow_mut().push((key, v.clone()));
         *self.memo.borrow_mut() = LookupMemo::default();
+        *self.builtin_paths.borrow_mut() = None;
     }
 
     /// Resolve expansion-made imports by canonical scope, never by prepending glob paths.
@@ -2037,10 +2039,36 @@ impl MacroScope {
             inputs.read(&self.table, LookupInput::Alias(name));
             if !self.table.expansion_alias(name_s) { return None; }
         }
-        ImportLookup {
-            scope: self, origin: cur, memo: &mut memo.imports, inputs,
-            states: Vec::new(), seen: Default::default(), ready: Default::default(),
-        }.lookup(name, cur, path, module)
+        ImportLookup::new(self, cur, &mut memo.imports, inputs).lookup(name, cur, path, module)
+    }
+
+    fn extern_shadowed(&self, origin: Name, cur: Name, module: Name, path: &[Name]) -> bool {
+        let Some(&first) = path.first() else { return false };
+        let names = &*self.table.names;
+        let fs = names.str(first);
+        if matches!(fs, "crate" | "self" | "super" | "") || fs.starts_with("__relax_crate_") {
+            return false;
+        }
+        let (cur_s, mod_s) = (names.str(cur), names.str(module));
+        if (Res { table: &self.table }).extern_crate(cur_s, fs).is_none() {
+            return false;
+        }
+        if cur == origin {
+            let local = self.local_uses.borrow();
+            if !local.bindings.is_empty() {
+                if local.bindings.contains_key(&(module, first))
+                    || local.bindings.contains_key(&(module, GLOB_ID))
+                    || names.get(&format!("{mod_s}::{fs}")).is_some_and(|c| local.index(names).modules.contains(&c))
+                {
+                    return true;
+                }
+            }
+        }
+        self.table.exp_uses.get(cur_s).is_some_and(|u| {
+            u.contains_key(&(mod_s.to_string(), fs.to_string()))
+                || u.contains_key(&(mod_s.to_string(), GLOB.to_string()))
+                || self.table.expansion_module(cur_s, &format!("{mod_s}::{fs}"))
+        })
     }
 
     fn resolve(&self, name: Name, cur: Name, path: &[Name], module: Name, record: bool) -> Option<MacroRef> {
@@ -2052,7 +2080,20 @@ impl MacroScope {
         let mut inputs = LookupInputs::new(&self.table);
         inputs.read(&self.table, LookupInput::Definitions(name));
         if path.is_empty() { inputs.read(&self.table, LookupInput::Prelude(cur)); }
-        let r = with_strs(names, path, |path| lookup_in(&self.table, &self.local, names.str(name), names.str(cur), path, names.str(module)))
+        let shadowed = self.extern_shadowed(cur, cur, module, path);
+        if let Some(&first) = path.first() {
+            let fs = names.str(first);
+            if !matches!(fs, "crate" | "self" | "super" | "") && !fs.starts_with("__relax_crate_")
+                && (Res { table: &self.table }).extern_crate(names.str(cur), fs).is_some()
+            {
+                inputs.read(&self.table, LookupInput::Import(cur, module, first));
+                inputs.read(&self.table, LookupInput::Import(cur, module, GLOB_ID));
+                inputs.read(&self.table, LookupInput::GeneratedModule(cur, names.id(&format!("{}::{fs}", names.str(module)))));
+            }
+        }
+        let r = (!shadowed)
+            .then(|| with_strs(names, path, |path| lookup_in(&self.table, &self.local, names.str(name), names.str(cur), path, names.str(module))))
+            .flatten()
             .or_else(|| self.lookup_via_local_use(name, cur, path, module, &mut memo, &mut inputs));
         if record {
             self.looked.borrow_mut().push(Looked { name, path: key.path.clone(), module, nlocal: self.local.len() as u32, nuses: self.uses_log.borrow().len() as u32, got: r.clone(), inputs: std::sync::Arc::new(inputs), was: None });
@@ -2165,6 +2206,27 @@ impl MacroScope {
         r
     }
 
+    fn resolve_mod_path(&self, origin: &str, k: &str, m: &str, prefix: &[String]) -> Option<(String, String)> {
+        if prefix.is_empty() { return Some((k.to_string(), m.to_string())); }
+        let r = Res { table: &self.table };
+        let names = &*self.table.names;
+        let origin_id = names.id(origin);
+        let k_id = names.id(k);
+        let m_id = names.id(m);
+        let ids: Vec<Name> = prefix.iter().map(|s| names.id(s)).collect();
+        if !self.extern_shadowed(origin_id, k_id, m_id, &ids) {
+            if let Some((tk, tm)) = r.resolve_mod(k, m, prefix) {
+                return Some((tk.to_string(), tm.to_string()));
+            }
+        }
+        let mut memo = self.memo.borrow_mut();
+        if memo.origin != origin_id { *memo = LookupMemo { origin: origin_id, ..Default::default() }; }
+        let mut inputs = LookupInputs::new(&self.table);
+        let (tk, tm) = ImportLookup::new(self, origin_id, &mut memo.imports, &mut inputs)
+            .resolve_mod(k_id, m_id, &ids)?;
+        Some((names.str(tk).to_string(), names.str(tm).to_string()))
+    }
+
     /// Whether the qualified call `path` of a built-in the parser reads in place (`std::vec!`)
     /// reaches a built-in, as rustc's resolve of the path must: its module part names a module
     /// (else rustc's E0433 at the segment that names nothing), of a std crate, whose built-ins
@@ -2172,23 +2234,92 @@ impl MacroScope {
     pub fn reaches_builtin(&self, cur: &str, module: &str, path: &[String]) -> bool {
         let Some((_, prefix)) = path.split_last() else { return false };
         if prefix.is_empty() { return true; }
-        match (Res { table: &self.table }).resolve_mod(cur, module, prefix) {
+        match self.resolve_mod_path(cur, cur, module, prefix) {
             None => false,
-            Some((k, _)) => matches!(krate_name(k), "core" | "std" | "alloc") || self.builtin_macro(cur, module, path).is_some(),
+            Some((k, _)) => matches!(krate_name(&k), "core" | "std" | "alloc") || self.builtin_macro(cur, module, path).is_some(),
         }
     }
 
     /// Follow standard macro re-exports as well as re-exported library modules.
     pub(crate) fn builtin_macro_path(&self, cur: &str, module: &str, path: &[String], seen: &mut MacroWalkSeen) -> Option<String> {
         let (name, prefix) = path.split_last()?;
+        let (k, m) = self.resolve_mod_path(cur, cur, module, prefix)?;
+        self.builtin_macro_in(cur, &k, &m, name, (k == cur).then_some(module), seen)
+    }
+
+    fn builtin_macro_in(&self, origin: &str, k: &str, m: &str, name: &str, req: Option<&str>, seen: &mut MacroWalkSeen) -> Option<String> {
+        let depth = req.map_or(0, |r| common_mod_prefix(m, r).len());
+        if !seen.insert((k.into(), m.into(), name.into(), depth)) { return None; }
         let r = Res { table: &self.table };
-        let (k, m) = if prefix.is_empty() { (cur, module) } else { r.resolve_mod(cur, module, prefix)? };
-        r.imported_macro(k, m, name, (k == cur).then_some(module), seen, &|k, m, name| {
-            let standard = matches!(k, "core" | "std" | "alloc") && m == k
-                && (crate::program::BUILTIN_MACROS.contains(&name) || (k == "std" && name == "dbg"));
-            let smallvec = krate_name(k) == "smallvec" && name == "smallvec" && r.crate_root(k).1 == m;
-            (standard || smallvec).then(|| name.to_string())
-        })
+        let standard = matches!(k, "core" | "std" | "alloc") && m == k
+            && (crate::program::BUILTIN_MACROS.contains(&name) || name == "cfg_select" || (k == "std" && name == "dbg"));
+        let smallvec = krate_name(k) == "smallvec" && name == "smallvec" && r.crate_root(k).1 == m;
+        if standard || smallvec { return Some(name.to_string()); }
+        if let Some(cm) = self.table.crates.get(k) {
+            if let Some(uses) = cm.uses.get(m) {
+                let visible = |u: &UseItem| exp_vis_visible(&r, k, m, &u.vis, req);
+                for u in uses.iter().filter(|u| u.bind.as_deref() == Some(name) && visible(u)) {
+                    let Some((target, prefix)) = u.path.split_last() else { continue };
+                    let Some((tk, tm)) = self.resolve_mod_path(origin, k, m, prefix) else { continue };
+                    if let Some(v) = self.builtin_macro_in(origin, &tk, &tm, target, next_req(k, m, &tk, req), seen) { return Some(v); }
+                }
+            }
+        }
+        let names = &*self.table.names;
+        let mut exp_single: Vec<Vec<String>> = Vec::new();
+        let mut exp_globs: Vec<Vec<String>> = Vec::new();
+        if k == origin {
+            let local = self.local_uses.borrow();
+            if let Some(mid) = names.get(m) {
+                if let Some(nid) = names.get(name) {
+                    if let Some(entries) = local.bindings.get(&(mid, nid)) {
+                        for u in entries.iter().rev() {
+                            if exp_vis_visible(&r, k, m, &u.vis, req) {
+                                exp_single.push(u.path.iter().map(|&id| names.str(id).to_string()).collect());
+                            }
+                        }
+                    }
+                }
+                if let Some(entries) = local.bindings.get(&(mid, GLOB_ID)) {
+                    for u in entries {
+                        if exp_vis_visible(&r, k, m, &u.vis, req) {
+                            exp_globs.push(u.path.iter().map(|&id| names.str(id).to_string()).collect());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(eu) = self.table.exp_uses.get(k) {
+            if let Some(entries) = eu.get(&(m.to_string(), name.to_string())) {
+                for u in entries.iter().rev() {
+                    if exp_vis_visible(&r, k, m, &u.vis, req) { exp_single.push(u.path.clone()); }
+                }
+            }
+            if let Some(entries) = eu.get(&(m.to_string(), GLOB.to_string())) {
+                for u in entries {
+                    if exp_vis_visible(&r, k, m, &u.vis, req) { exp_globs.push(u.path.clone()); }
+                }
+            }
+        }
+        for path in exp_single {
+            let Some((target, prefix)) = path.split_last() else { continue };
+            let Some((tk, tm)) = self.resolve_mod_path(origin, k, m, prefix) else { continue };
+            if let Some(v) = self.builtin_macro_in(origin, &tk, &tm, target, next_req(k, m, &tk, req), seen) { return Some(v); }
+        }
+        if let Some(cm) = self.table.crates.get(k) {
+            if let Some(uses) = cm.uses.get(m) {
+                let visible = |u: &UseItem| exp_vis_visible(&r, k, m, &u.vis, req);
+                for u in uses.iter().filter(|u| u.bind.is_none() && visible(u)) {
+                    let Some((tk, tm)) = self.resolve_mod_path(origin, k, m, &u.path) else { continue };
+                    if let Some(v) = self.builtin_macro_in(origin, &tk, &tm, name, next_req(k, m, &tk, req), seen) { return Some(v); }
+                }
+            }
+        }
+        for path in exp_globs {
+            let Some((tk, tm)) = self.resolve_mod_path(origin, k, m, &path) else { continue };
+            if let Some(v) = self.builtin_macro_in(origin, &tk, &tm, name, next_req(k, m, &tk, req), seen) { return Some(v); }
+        }
+        None
     }
 
     /// core's test attribute macros live in each edition's prelude. Resolve the
@@ -2347,6 +2478,14 @@ struct ImportState {
     value: Option<ImportValue>,
     waiting: Vec<usize>,
     local: bool,
+    queued: bool,
+    /// Local module state `(Module, k, m, name, Some(m))` permanently settled as `None`
+    /// after `ready` drained, unlocking extern-prelude fallback for its waiters.
+    extern_open: bool,
+    /// Self-named bare import (`pub use dep;`) whose in-scope globs settled without binding it.
+    self_extern_open: bool,
+    /// Deduplication bit for `ImportLookup::self_extern_wait`.
+    self_extern_waiting: bool,
 }
 
 #[derive(Clone)]
@@ -2369,9 +2508,66 @@ struct ImportLookup<'a> {
     states: Vec<ImportState>,
     seen: HashMap<ImportKey, usize>,
     ready: std::collections::VecDeque<usize>,
+    /// `(parent, local_state)` pairs waiting for `local_state` to settle as `None`
+    /// before falling back to `r.extern_crate` (deduplicated by `extern_wait_set`).
+    extern_wait: Vec<(Option<usize>, usize)>,
+    extern_wait_set: crate::fxhash::HashSet<(Option<usize>, usize)>,
+    /// Self-named bare imports (`pub use dep;` in a module that also has globs)
+    /// waiting for all non-self-bare work to settle before falling back to `r.extern_crate`.
+    self_extern_wait: Vec<usize>,
+    /// Set while `step` evaluates visible single imports if any single import deferred to
+    /// `extern_wait` or `self_extern_wait`, so globs do not race ahead of it.
+    step_waited_extern: bool,
 }
 
-impl ImportLookup<'_> {
+impl<'a> ImportLookup<'a> {
+    fn new(
+        scope: &'a MacroScope,
+        origin: Name,
+        memo: &'a mut HashMap<ImportKey, ImportAnswer>,
+        inputs: &'a mut LookupInputs,
+    ) -> Self {
+        Self {
+            scope,
+            origin,
+            memo,
+            inputs,
+            states: Vec::new(),
+            seen: Default::default(),
+            ready: Default::default(),
+            extern_wait: Vec::new(),
+            extern_wait_set: Default::default(),
+            self_extern_wait: Vec::new(),
+            step_waited_extern: false,
+        }
+    }
+
+    fn enqueue(&mut self, i: usize) {
+        let s = &mut self.states[i];
+        if s.value.is_none() && !s.extern_open && !s.queued {
+            s.queued = true;
+            self.ready.push_back(i);
+        }
+    }
+
+    fn record_extern_wait(&mut self, parent: Option<usize>, j: usize) {
+        self.step_waited_extern = true;
+        if parent == Some(j) {
+            return;
+        }
+        if self.extern_wait_set.insert((parent, j)) {
+            self.extern_wait.push((parent, j));
+        }
+    }
+
+    fn record_self_extern_wait(&mut self, p: usize) {
+        self.step_waited_extern = true;
+        if !self.states[p].self_extern_waiting {
+            self.states[p].self_extern_waiting = true;
+            self.self_extern_wait.push(p);
+        }
+    }
+
     fn ask(&mut self, ns: ImportNs, k: Name, m: Name, n: Name, req: Option<Name>, parent: Option<usize>) -> Option<ImportValue> {
         let key = ImportKey { ns, krate: k, module: m, name: n, req };
         if let Some(answer) = self.memo.get(&key) {
@@ -2388,7 +2584,16 @@ impl ImportLookup<'_> {
             None => {
                 let i = self.states.len();
                 self.seen.insert(key, i);
-                self.states.push(ImportState { key, value: None, waiting: Vec::new(), local: k == self.origin });
+                self.states.push(ImportState {
+                    key,
+                    value: None,
+                    waiting: Vec::new(),
+                    local: k == self.origin,
+                    queued: true,
+                    extern_open: false,
+                    self_extern_open: false,
+                    self_extern_waiting: false,
+                });
                 self.ready.push_back(i);
                 i
             }
@@ -2400,10 +2605,92 @@ impl ImportLookup<'_> {
         state.value.clone()
     }
 
+    /// Query `(ImportNs::Module, k, m, n, req)`. Returns `Ok((tk, tm))` if resolved,
+    /// `Err(None)` if definitively absent from cache, or `Err(Some(state_idx))` if still
+    /// pending in this fixpoint.
+    fn ask_module(
+        &mut self,
+        k: Name,
+        m: Name,
+        n: Name,
+        req: Option<Name>,
+        parent: Option<usize>,
+    ) -> Result<(Name, Name), Option<usize>> {
+        let key = ImportKey { ns: ImportNs::Module, krate: k, module: m, name: n, req };
+        if let Some(answer) = self.memo.get(&key) {
+            self.inputs.depend(&answer.inputs);
+            if answer.local {
+                if let Some(parent) = parent { self.states[parent].local = true; }
+            }
+            return match answer.value {
+                Some(ImportValue::Module(tk, tm)) => Ok((tk, tm)),
+                None => Err(None),
+                Some(ImportValue::Macro(_)) => unreachable!(),
+            };
+        }
+        if let Some(answer) = self.scope.table.import_snapshot.0.read().unwrap()
+            .get(&self.origin).and_then(|memo| memo.get(&key))
+        {
+            self.inputs.depend(&answer.inputs);
+            return match answer.value {
+                Some(ImportValue::Module(tk, tm)) => Ok((tk, tm)),
+                None => Err(None),
+                Some(ImportValue::Macro(_)) => unreachable!(),
+            };
+        }
+        let i = match self.seen.get(&key) {
+            Some(&i) => i,
+            None => {
+                let i = self.states.len();
+                self.seen.insert(key, i);
+                self.states.push(ImportState {
+                    key,
+                    value: None,
+                    waiting: Vec::new(),
+                    local: k == self.origin,
+                    queued: true,
+                    extern_open: false,
+                    self_extern_open: false,
+                    self_extern_waiting: false,
+                });
+                self.ready.push_back(i);
+                i
+            }
+        };
+        let state = &mut self.states[i];
+        if let Some(parent) = parent {
+            if !state.waiting.contains(&parent) { state.waiting.push(parent); }
+        }
+        match state.value {
+            Some(ImportValue::Module(tk, tm)) => Ok((tk, tm)),
+            None => Err(Some(i)),
+            Some(ImportValue::Macro(_)) => unreachable!(),
+        }
+    }
+
     fn module_name(&mut self, k: Name, m: Name, n: Name, req: Option<Name>, parent: Option<usize>) -> Option<(Name, Name)> {
-        match self.ask(ImportNs::Module, k, m, n, req, parent)? {
-            ImportValue::Module(k, m) => Some((k, m)),
-            ImportValue::Macro(_) => unreachable!(),
+        self.ask_module(k, m, n, req, parent).ok()
+    }
+
+    /// Resolve a bare first segment `n` in `(k, m)`'s own scope first; fall back to
+    /// `r.extern_crate` only once `(Module, k, m, n, Some(m))` is definitively `None`.
+    fn bare_or_extern(&mut self, k: Name, m: Name, n: Name, parent: Option<usize>) -> Option<(Name, Name)> {
+        match self.ask_module(k, m, n, Some(m), parent) {
+            Ok(at) => Some(at),
+            Err(pending) => {
+                let names = &*self.scope.table.names;
+                let r = Res { table: &self.scope.table };
+                let ext = r.extern_crate(names.str(k), names.str(n))
+                    .map(|(ek, em)| (names.id(ek), names.id(em)))?;
+                match pending {
+                    None => Some(ext),
+                    Some(j) if self.states[j].extern_open => Some(ext),
+                    Some(j) => {
+                        self.record_extern_wait(parent, j);
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -2414,7 +2701,6 @@ impl ImportLookup<'_> {
         let r = Res { table: &scope.table };
         let ids = |(k, m): (&str, &str)| (names.id(k), names.id(m));
         let (ks, ms) = (names.str(k), names.str(m));
-        if let Some(at) = with_strs(names, path, |ps| r.resolve_mod(ks, ms, ps).map(ids)) { return Some(at); }
         let first = names.str(path[0]);
         let (mut at, rest) = match first {
             "crate" => (ids(r.crate_root(ks)), &path[1..]),
@@ -2428,7 +2714,7 @@ impl ImportLookup<'_> {
                 let at = if let Some(defining) = first.strip_prefix("__relax_crate_") {
                     ids(r.crate_root(defining))
                 } else {
-                    self.module_name(k, m, path[0], Some(m), parent).or_else(|| r.extern_crate(ks, first).map(ids))?
+                    self.bare_or_extern(k, m, path[0], parent)?
                 };
                 (at, &path[1..])
             }
@@ -2523,21 +2809,89 @@ impl ImportLookup<'_> {
         out
     }
 
-    fn resolve_module_binding(&mut self, k: Name, m: Name, path: &[Name], req: Option<&str>, parent: Option<usize>) -> Option<ImportValue> {
-        let table = &self.scope.table;
+    /// Resolve one visible `ImportNs::Module` binding `path` in `(k, m)` for bound name `n`
+    /// under caller visibility `req`. In-scope module bindings shadow same-named extern crates
+    /// even when the caller cannot see them; leaf visibility is checked under `next_req`.
+    fn resolve_module_binding(
+        &mut self,
+        k: Name,
+        m: Name,
+        n: Name,
+        path: &[Name],
+        req: Option<&str>,
+        parent: Option<usize>,
+    ) -> Option<ImportValue> {
+        let scope = self.scope;
+        let table = &scope.table;
         let names = &*table.names;
         let (ks, ms) = (names.str(k), names.str(m));
         let r = Res { table };
         let (&last, prefix) = path.split_last()?;
         let leaf = names.str(last);
-        let absolute = matches!(prefix, [root] if names.str(*root).is_empty());
-        let extern_leaf = (prefix.is_empty() || absolute) && r.extern_crate(ks, leaf).is_some();
-        if matches!(leaf, "crate" | "self" | "super") || leaf.starts_with("__relax_crate_") || extern_leaf {
-            return self.path(k, m, path, parent).map(|(k, m)| ImportValue::Module(k, m));
+        if matches!(leaf, "crate" | "self" | "super") || leaf.starts_with("__relax_crate_") {
+            return self.path(k, m, path, parent).map(|(tk, tm)| ImportValue::Module(tk, tm));
+        }
+        let next = |target: Name| next_req(ks, ms, names.str(target), req).map(|p| names.id(p));
+        // `::dep` queries the extern prelude directly in 2018+, unshadowed by local modules.
+        if matches!(prefix, [root] if names.str(*root).is_empty()) {
+            if let Some((ek, em)) = r.extern_crate(ks, leaf) {
+                return Some(ImportValue::Module(names.id(ek), names.id(em)));
+            }
+        }
+        if prefix.is_empty() {
+            if last == n {
+                // Self-named bare import (`pub use dep;`): check in-scope globs before the
+                // extern prelude (asking `(k, m, n)` directly would self-cycle).
+                let ext = r.extern_crate(ks, leaf)
+                    .map(|(ek, em)| ImportValue::Module(names.id(ek), names.id(em)));
+                let globs = self.globs(k, m, Some(ms));
+                if !globs.is_empty() {
+                    let mut all_settled = true;
+                    for gpath in globs {
+                        let Some((gk, gm)) = self.path(k, m, &gpath, parent) else {
+                            all_settled = false;
+                            continue;
+                        };
+                        match self.ask_module(gk, gm, last, (gk == k).then_some(m), parent) {
+                            Ok(_) => return self.ask(ImportNs::Module, gk, gm, last, next(gk), parent),
+                            Err(Some(j)) if !self.states[j].extern_open => {
+                                all_settled = false;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if !all_settled {
+                        let ext = ext?;
+                        let p = parent?;
+                        if !self.states[p].self_extern_open {
+                            self.record_self_extern_wait(p);
+                            return None;
+                        }
+                        return Some(ext);
+                    }
+                }
+                return ext;
+            }
+            // Bare leaf (`use foo as bar;`): check `(k, m)`'s own module scope first.
+            // If bound there (even privately/restricted), suppress extern fallback and enforce `next(k)`.
+            return match self.ask_module(k, m, last, Some(m), parent) {
+                Ok(_) => self.ask(ImportNs::Module, k, m, last, next(k), parent),
+                Err(pending) => {
+                    let ext = r.extern_crate(ks, leaf)
+                        .map(|(ek, em)| ImportValue::Module(names.id(ek), names.id(em)))?;
+                    match pending {
+                        None => Some(ext),
+                        Some(j) if self.states[j].extern_open => Some(ext),
+                        Some(j) => {
+                            self.record_extern_wait(parent, j);
+                            None
+                        }
+                    }
+                }
+            };
         }
         let (tk, tm) = self.path(k, m, prefix, parent)?;
-        let next = next_req(ks, ms, names.str(tk), req).map(|p| names.id(p));
-        self.ask(ImportNs::Module, tk, tm, last, next, parent)
+        self.ask(ImportNs::Module, tk, tm, last, next(tk), parent)
     }
 
     fn resolve_macro_binding(&mut self, k: Name, m: Name, path: &[Name], req: Option<&str>, parent: Option<usize>) -> Option<ImportValue> {
@@ -2654,14 +3008,18 @@ impl ImportLookup<'_> {
             }
         }
         let (visible, hidden) = self.bindings(k, m, n, req);
+        self.step_waited_extern = false;
         for path in visible {
             let found = match ns {
-                ImportNs::Module => self.resolve_module_binding(k, m, &path, req, Some(i)),
+                ImportNs::Module => self.resolve_module_binding(k, m, n, &path, req, Some(i)),
                 ImportNs::Macro => self.resolve_macro_binding(k, m, &path, req, Some(i)),
             };
             if let Some(value) = found { return Some(value); }
         }
         if hidden.iter().any(|path| self.hidden_binding_shadows(ns, k, m, path)) { return None; }
+        if self.step_waited_extern {
+            return None;
+        }
         for path in self.globs(k, m, req) {
             if let Some((k, m)) = self.path(k, m, &path, Some(i)) {
                 if let Some(value) = self.ask(ns, k, m, n, next(k), Some(i)) { return Some(value); }
@@ -2670,29 +3028,216 @@ impl ImportLookup<'_> {
         None
     }
 
-    fn lookup(&mut self, name: Name, k: Name, path: &[Name], module: Name) -> Option<MacroRef> {
-        let origin = k;
-        let result = loop {
-            if let Some((k, m)) = self.path(k, module, path, None) {
-                if let Some(ImportValue::Macro(d)) = self.ask(ImportNs::Macro, k, m, name, (origin == k).then_some(module), None) {
-                    if self.ready.is_empty() { break Some(d); }
+    fn drain_ready(&mut self) {
+        while let Some(i) = self.ready.pop_front() {
+            self.states[i].queued = false;
+            if self.states[i].value.is_some() || self.states[i].extern_open { continue; }
+            if let Some(value) = self.step(i) {
+                self.states[i].value = Some(value);
+                let waiting = std::mem::take(&mut self.states[i].waiting);
+                for &w in &waiting {
+                    self.enqueue(w);
+                }
+                self.states[i].waiting = waiting;
+            }
+        }
+    }
+
+    fn open_extern_targets(&mut self, open_mask: &[bool]) -> bool {
+        for (j, &open) in open_mask.iter().enumerate() {
+            if open {
+                self.states[j].extern_open = true;
+            }
+        }
+        let mut progressed = false;
+        let mut keep = Vec::new();
+        for (p, j) in std::mem::take(&mut self.extern_wait) {
+            if open_mask[j] {
+                self.extern_wait_set.remove(&(p, j));
+                if let Some(p) = p {
+                    self.enqueue(p);
+                }
+                progressed = true;
+            } else {
+                keep.push((p, j));
+            }
+        }
+        self.extern_wait = keep;
+        progressed
+    }
+
+    fn unlock_externs(&mut self) -> bool {
+        self.extern_wait.retain(|&(p, j)| {
+            let keep = self.states[j].value.is_none()
+                && !self.states[j].extern_open
+                && p.is_none_or(|p| self.states[p].value.is_none() && !self.states[p].extern_open);
+            if !keep {
+                self.extern_wait_set.remove(&(p, j));
+            }
+            keep
+        });
+        self.self_extern_wait.retain(|&s| {
+            let keep = self.states[s].value.is_none()
+                && !self.states[s].extern_open
+                && !self.states[s].self_extern_open;
+            if !keep {
+                self.states[s].self_extern_waiting = false;
+            }
+            keep
+        });
+
+        let n = self.states.len();
+        if !self.extern_wait.is_empty() {
+            let mut self_blocked = vec![false; n];
+            if !self.self_extern_wait.is_empty() {
+                let mut work = std::collections::VecDeque::new();
+                for &s in &self.self_extern_wait {
+                    if !self_blocked[s] {
+                        self_blocked[s] = true;
+                        work.push_back(s);
+                    }
+                }
+                while let Some(u) = work.pop_front() {
+                    for &w in &self.states[u].waiting {
+                        if self.states[w].value.is_none() && !self.states[w].extern_open && !self_blocked[w] {
+                            self_blocked[w] = true;
+                            work.push_back(w);
+                        }
+                    }
                 }
             }
-            if self.ready.is_empty() { break None; }
-            while let Some(i) = self.ready.pop_front() {
-                if self.states[i].value.is_some() { continue; }
-                if let Some(value) = self.step(i) {
-                    self.states[i].value = Some(value);
-                    self.ready.extend(self.states[i].waiting.iter().copied());
+
+            // Tier 1: release every unblocked extern target `j` that no OTHER pending extern
+            // target `k != j` can reach via `extern_wait` + `.waiting` (direct or cyclic
+            // self-waits on `j` alone can never resolve `j` locally).
+            let reach = reach_two_sources(
+                &self.states,
+                self.extern_wait.iter().filter_map(|&(p, k)| {
+                    let p = p?;
+                    (p != k && !self_blocked[k]).then_some((p, k))
+                }),
+            );
+            let mut open_mask = vec![false; n];
+            let mut any_open = false;
+            let mut unblocked_targets = Vec::new();
+            let mut seen_target = vec![false; n];
+            for &(_, j) in &self.extern_wait {
+                if self_blocked[j] || seen_target[j] { continue; }
+                seen_target[j] = true;
+                let slots = reach[j];
+                let blocked_by_other = (slots[0] != usize::MAX && slots[0] != j)
+                    || (slots[1] != usize::MAX && slots[1] != j);
+                if !blocked_by_other {
+                    open_mask[j] = true;
+                    any_open = true;
+                } else {
+                    unblocked_targets.push(j);
                 }
             }
-        };
-        // Propagate local dependence through the same edges as bindings, including
-        // cycles and failed queries. Negative answers need the same protection.
-        let mut local: std::collections::VecDeque<_> = self.states.iter().enumerate().filter_map(|(i, s)| s.local.then_some(i)).collect();
+            if any_open {
+                return self.open_extern_targets(&open_mask);
+            }
+
+            // Tier 2: every unblocked target lies in or depends on a mutual extern cycle
+            // (e.g. `use a::*; use b::*;`). Open the lowest-index target in a sink SCC of the
+            // dependency graph (source SCC of the influence graph) so the others can settle locally.
+            if !unblocked_targets.is_empty() {
+                unblocked_targets.sort_unstable();
+                let mut target_slot = vec![usize::MAX; n];
+                for (idx, &j) in unblocked_targets.iter().enumerate() {
+                    target_slot[j] = idx;
+                }
+                let num_nodes = n + unblocked_targets.len();
+                let mut adj = vec![Vec::new(); num_nodes];
+                for u in 0..n {
+                    if self.states[u].value.is_none() && !self.states[u].extern_open && !self_blocked[u] {
+                        for &w in &self.states[u].waiting {
+                            if self.states[w].value.is_none() && !self.states[w].extern_open && !self_blocked[w] {
+                                adj[u].push(w);
+                            }
+                        }
+                    }
+                }
+                for (idx, &j) in unblocked_targets.iter().enumerate() {
+                    adj[j].push(n + idx);
+                }
+                for &(p, k) in &self.extern_wait {
+                    let Some(p) = p else { continue };
+                    if p != k && !self_blocked[p] && target_slot[k] != usize::MAX {
+                        adj[n + target_slot[k]].push(p);
+                    }
+                }
+                let roots: Vec<usize> = (n..num_nodes).collect();
+                let sink = source_scc_roots(num_nodes, &adj, &roots);
+                if let Some(&open_node) = sink.first() {
+                    open_mask[unblocked_targets[open_node - n]] = true;
+                    return self.open_extern_targets(&open_mask);
+                }
+            }
+        }
+
+        // Tier 3: no unblocked `extern_wait` remains. Release self-named bare imports
+        // (`pub use dep;` with globs), stratified along `.waiting`, breaking any mutual cycle
+        // by its lowest-index source SCC.
+        if !self.self_extern_wait.is_empty() {
+            let reach = reach_two_sources(
+                &self.states,
+                self.self_extern_wait.iter().map(|&s| (s, s)),
+            );
+            let mut progressed = false;
+            let mut keep = Vec::new();
+            for s in std::mem::take(&mut self.self_extern_wait) {
+                let slots = reach[s];
+                let blocked_by_other = (slots[0] != usize::MAX && slots[0] != s)
+                    || (slots[1] != usize::MAX && slots[1] != s);
+                if !blocked_by_other {
+                    self.states[s].self_extern_waiting = false;
+                    self.states[s].self_extern_open = true;
+                    self.enqueue(s);
+                    progressed = true;
+                } else {
+                    keep.push(s);
+                }
+            }
+            self.self_extern_wait = keep;
+            if progressed {
+                return true;
+            }
+            if !self.self_extern_wait.is_empty() {
+                let mut roots = self.self_extern_wait.clone();
+                roots.sort_unstable();
+                let mut adj = vec![Vec::new(); n];
+                for u in 0..n {
+                    if self.states[u].value.is_none() && !self.states[u].extern_open {
+                        for &w in &self.states[u].waiting {
+                            if self.states[w].value.is_none() && !self.states[w].extern_open {
+                                adj[u].push(w);
+                            }
+                        }
+                    }
+                }
+                let sink = source_scc_roots(n, &adj, &roots);
+                if let Some(&s) = sink.first() {
+                    self.states[s].self_extern_waiting = false;
+                    self.states[s].self_extern_open = true;
+                    self.self_extern_wait.retain(|&x| x != s);
+                    self.enqueue(s);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn finish_states(&mut self) {
+        let mut local: std::collections::VecDeque<_> = self.states.iter().enumerate()
+            .filter_map(|(i, s)| s.local.then_some(i)).collect();
         while let Some(i) = local.pop_front() {
             for parent in self.states[i].waiting.clone() {
-                if !self.states[parent].local { self.states[parent].local = true; local.push_back(parent); }
+                if !self.states[parent].local {
+                    self.states[parent].local = true;
+                    local.push_back(parent);
+                }
             }
         }
         let mut shared = self.scope.table.import_snapshot.0.write().unwrap();
@@ -2704,8 +3249,149 @@ impl ImportLookup<'_> {
             if !state.local { shared.insert(state.key, answer.clone()); }
             self.memo.insert(state.key, answer);
         }
+    }
+
+    fn lookup(&mut self, name: Name, k: Name, path: &[Name], module: Name) -> Option<MacroRef> {
+        let origin = k;
+        let result = loop {
+            if let Some((tk, tm)) = self.path(k, module, path, None) {
+                if let Some(ImportValue::Macro(d)) = self.ask(ImportNs::Macro, tk, tm, name, (origin == tk).then_some(module), None) {
+                    if self.ready.is_empty() { break Some(d); }
+                }
+            }
+            if !self.ready.is_empty() {
+                self.drain_ready();
+                continue;
+            }
+            if !self.unlock_externs() {
+                break None;
+            }
+        };
+        self.finish_states();
         result
     }
+
+    fn resolve_mod(&mut self, k: Name, module: Name, path: &[Name]) -> Option<(Name, Name)> {
+        let result = loop {
+            if let Some(at) = self.path(k, module, path, None) {
+                if self.ready.is_empty() { break Some(at); }
+            }
+            if !self.ready.is_empty() {
+                self.drain_ready();
+                continue;
+            }
+            if !self.unlock_externs() {
+                break None;
+            }
+        };
+        self.finish_states();
+        result
+    }
+}
+
+/// For each unresolved, non-`extern_open` state, record up to two distinct source ids that
+/// can reach it along `.waiting` edges from `seeds`. Tracking at most two sources per vertex
+/// is exact for testing "does any source != j reach j?" in `O(|states| + |edges| + |seeds|)`.
+fn reach_two_sources(
+    states: &[ImportState],
+    seeds: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<[usize; 2]> {
+    const NONE: usize = usize::MAX;
+    let mut reach = vec![[NONE; 2]; states.len()];
+    let mut work = std::collections::VecDeque::new();
+    let offer = |reach: &mut [[usize; 2]], work: &mut std::collections::VecDeque<(usize, usize)>, u: usize, src: usize| {
+        let slots = &mut reach[u];
+        if slots[0] == src || slots[1] == src {
+            return;
+        }
+        if slots[0] == NONE {
+            slots[0] = src;
+            work.push_back((u, src));
+        } else if slots[1] == NONE {
+            slots[1] = src;
+            work.push_back((u, src));
+        }
+    };
+    for (u, src) in seeds {
+        if states[u].value.is_none() && !states[u].extern_open {
+            offer(&mut reach, &mut work, u, src);
+        }
+    }
+    while let Some((u, src)) = work.pop_front() {
+        for &w in &states[u].waiting {
+            if states[w].value.is_none() && !states[w].extern_open {
+                offer(&mut reach, &mut work, w, src);
+            }
+        }
+    }
+    reach
+}
+
+/// Iterative Tarjan SCC over the subgraph reachable from `roots`. Returns every `r` in
+/// `roots` (preserving `roots` order) whose SCC has in-degree 0 among visited SCCs.
+fn source_scc_roots(num_nodes: usize, adj: &[Vec<usize>], roots: &[usize]) -> Vec<usize> {
+    const UNVISITED: u32 = u32::MAX;
+    let mut index = vec![UNVISITED; num_nodes];
+    let mut low = vec![0u32; num_nodes];
+    let mut on_stack = vec![false; num_nodes];
+    let mut comp = vec![UNVISITED; num_nodes];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut dfs: Vec<(usize, usize)> = Vec::new();
+    let mut next_index = 0u32;
+    let mut num_comps = 0u32;
+
+    for &root in roots {
+        if index[root] != UNVISITED { continue; }
+        index[root] = next_index;
+        low[root] = next_index;
+        next_index += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        dfs.push((root, 0));
+        while let Some(&(u, ei)) = dfs.last() {
+            if ei < adj[u].len() {
+                dfs.last_mut().unwrap().1 = ei + 1;
+                let v = adj[u][ei];
+                if index[v] == UNVISITED {
+                    index[v] = next_index;
+                    low[v] = next_index;
+                    next_index += 1;
+                    stack.push(v);
+                    on_stack[v] = true;
+                    dfs.push((v, 0));
+                } else if on_stack[v] {
+                    low[u] = low[u].min(index[v]);
+                }
+            } else {
+                dfs.pop();
+                if let Some(&(parent, _)) = dfs.last() {
+                    low[parent] = low[parent].min(low[u]);
+                }
+                if low[u] == index[u] {
+                    let cid = num_comps;
+                    num_comps += 1;
+                    while let Some(w) = stack.pop() {
+                        on_stack[w] = false;
+                        comp[w] = cid;
+                        if w == u { break; }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut has_incoming = vec![false; num_comps as usize];
+    for (u, edges) in adj.iter().enumerate() {
+        let cu = comp[u];
+        if cu == UNVISITED { continue; }
+        for &v in edges {
+            let cv = comp[v];
+            if cv != UNVISITED && cu != cv {
+                has_incoming[cv as usize] = true;
+            }
+        }
+    }
+    roots.iter().copied().filter(|&r| !has_incoming[comp[r] as usize]).collect()
 }
 
 impl MacroUse {
@@ -4761,6 +5447,20 @@ mod replay_tests {
             cm.add_use(UseItem { module, path: vec!["crate".into(), "value".into()], bind: Some("value".into()), vis: UseVis::Pub });
             table.add_exp_uses("dep", [(("dep::facade".into(), format!("{leaf}_alias")), vec![ExpUse { path: vec!["self".into(), "hidden".into(), leaf.into()], vis: UseVis::Pub }])]);
         }
+        cm.externs.insert("other".into(), "first".into());
+        let public_use = |module: &str, bind: &str, path: &[&str]| {
+            ((module.to_string(), bind.to_string()), vec![ExpUse {
+                path: path.iter().map(|s| s.to_string()).collect(), vis: UseVis::Pub,
+            }])
+        };
+        table.add_exp_uses("dep", [
+            public_use("dep::facade", "other", &["self", "hidden", "restricted"]),
+            public_use("dep::facade", "bare_alias", &["other"]),
+            public_use("dep::facade::hidden::restricted", "nested", &["crate", "facade", "hidden", "restricted"]),
+            public_use("dep::facade", "qualified_alias", &["other", "nested"]),
+        ]);
+        table.add_exp_uses("first", [public_use("first", "nested", &["crate"])]);
+        table.push(definition("first", "two"));
         table.add_crate("dep".into(), std::sync::Arc::new(cm));
         table.push(definition("dep", "one"));
         let scope = MacroScope::new(std::sync::Arc::new(table));
@@ -4768,6 +5468,114 @@ mod replay_tests {
         assert!(scope.lookup("value", "dep", &path("crate", "restricted_alias"), "dep").is_some(), "crate-visible leaf");
         assert!(scope.lookup("value", "app", &path("dep", "public_alias"), "app").is_some(), "public leaf behind a private prefix");
         assert!(scope.lookup("value", "app", &path("dep", "restricted_alias"), "app").is_none(), "crate-visible leaf from another crate");
+        for alias in ["qualified_alias", "bare_alias"] {
+            assert!(scope.lookup("value", "app", &path("dep", alias), "app").is_none(), "restricted local module via {alias} from outside");
+            assert_eq!(scope.lookup("value", "dep", &path("crate", alias), "dep").unwrap().krate, "dep", "restricted local module via {alias} from inside");
+        }
+        assert_eq!(scope.lookup("value", "dep", &["other".into()], "dep::facade").unwrap().krate, "dep", "direct call through a shadowed extern");
+    }
+
+    #[test]
+    fn extern_prelude_shadowing_stratification_and_replay() {
+        let mut table = macro_table();
+        let mut dep = table.crates["dep"].unresolved();
+        for (name, krate) in [("first", "first"), ("second", "second"), ("other", "first")] {
+            dep.externs.insert(name.into(), krate.into());
+        }
+        dep.mods.insert("dep::facade".into());
+        dep.items.insert("dep::facade".into(), ModItem { vis: UseVis::Pub, ..Default::default() });
+        table.add_crate("dep".into(), std::sync::Arc::new(dep));
+        let module_with_value = |table: &mut MacroTable, k: &str, module: &str, vis: UseVis, target: &str| {
+            let mut cm = table.crates[k].unresolved();
+            cm.mods.insert(module.into());
+            cm.items.insert(module.into(), ModItem { vis, ..Default::default() });
+            cm.add_use(UseItem { module: module.into(), path: vec!["crate".into(), target.into()],
+                bind: Some("value".into()), vis: UseVis::Pub });
+            table.add_crate(k.into(), std::sync::Arc::new(cm));
+        };
+        module_with_value(&mut table, "first", "first::sub", UseVis::Pub, "value");
+        for k in ["first", "second"] { table.push(definition(k, "target")); }
+        let entry = |bind: &str, path: &[&str]| {
+            (("dep::facade".into(), bind.into()), vec![ExpUse {
+                path: path.iter().map(|s| s.to_string()).collect(), vis: UseVis::Pub,
+            }])
+        };
+        let scope_with = |base: &MacroTable, imports: &[(&str, &[&str])]| {
+            let mut next = base.clone();
+            next.add_exp_uses("dep", imports.iter().map(|(bind, path)| entry(bind, path)));
+            MacroScope::new(std::sync::Arc::new(next))
+        };
+        let from_app = |scope: &MacroScope, alias: &str| {
+            let path = ["dep".into(), "facade".into(), alias.into()];
+            scope.lookup("value", "app", &path, "app").map(|d| d.krate.clone())
+        };
+
+        let chain = scope_with(&table, &[("second", &["first", "sub"]), ("alias", &["second"])]);
+        assert_eq!(from_app(&chain, "alias").as_deref(), Some("first"), "the local second depends on the first extern fallback");
+        let value = scope_with(&table, &[("second", &["crate", "not_a_mod"]), ("alias", &["second"])]);
+        assert_eq!(from_app(&value, "alias").as_deref(), Some("second"), "a value-only binding leaves the extern module visible");
+        let absolute = scope_with(&table, &[("first", &["", "second"]), ("abs_alias", &["", "first"])]);
+        assert_eq!(from_app(&absolute, "first").as_deref(), Some("second"), "local first shadows the extern");
+        assert_eq!(from_app(&absolute, "abs_alias").as_deref(), Some("first"), "absolute first bypasses that shadow");
+
+        let bare = ("first", &["first"][..]);
+        let plain = scope_with(&table, &[bare]);
+        assert_eq!(from_app(&plain, "first").as_deref(), Some("first"), "self-named extern re-export");
+        let same = scope_with(&table, &[bare, (GLOB, &["first"])]);
+        assert_eq!(from_app(&same, "first").as_deref(), Some("first"), "both the glob and the re-export name the extern");
+        let via_second = [bare, (GLOB, &["second"])];
+        let unrelated = scope_with(&table, &via_second);
+        assert_eq!(from_app(&unrelated, "first").as_deref(), Some("first"), "unrelated extern glob leaves first visible");
+        let mut glob_source = table.clone();
+        module_with_value(&mut glob_source, "second", "second::first", UseVis::Pub, "value");
+        let public = scope_with(&glob_source, &via_second);
+        assert_eq!(from_app(&public, "first").as_deref(), Some("second"), "the extern glob provides a public module first");
+        // A restricted leaf inside the same crate is selectable there, and blocks the
+        // same-named extern for a caller that cannot see the leaf.
+        glob_source.push(definition("dep", "target"));
+        let mut dep = glob_source.crates["dep"].unresolved();
+        dep.mods.insert("dep::facade::provider".into());
+        glob_source.add_crate("dep".into(), std::sync::Arc::new(dep));
+        module_with_value(&mut glob_source, "dep", "dep::facade::provider::first", UseVis::Crate, "value");
+        let restricted = scope_with(&glob_source, &[bare, (GLOB, &["self", "provider"])]);
+        let inside = ["crate".into(), "facade".into(), "first".into()];
+        assert_eq!(restricted.lookup("value", "dep", &inside, "dep").unwrap().krate, "dep");
+        assert!(from_app(&restricted, "first").is_none(), "restricted leaf is hidden from another crate");
+
+        let mut mutual = macro_table();
+        mutual.push(definition("second", "target"));
+        let scope = MacroScope::new(std::sync::Arc::new(mutual));
+        scope.add_glob_use("app", vec!["first".into()], UseVis::Private);
+        scope.add_glob_use("app", vec!["second".into()], UseVis::Private);
+        assert_eq!(scope.lookup("value", "app", &[], "app").unwrap().krate, "second", "two extern globs can release a mutual wait");
+
+        let mut sibling = macro_table();
+        sibling.push(definition("dep", "target"));
+        let mut local = (*definition("app", "target")).clone();
+        local.name = "local_value".into();
+        sibling.define(local);
+        let mut app = sibling.crates["app"].unresolved();
+        app.mods.insert("app::local".into());
+        sibling.add_crate("app".into(), std::sync::Arc::new(app));
+        module_with_value(&mut sibling, "app", "app::local::dep", UseVis::Pub, "local_value");
+        let scope = MacroScope::new(std::sync::Arc::new(sibling));
+        scope.add_use("app", "alias".into(), vec!["self".into(), "local".into()], UseVis::Private);
+        scope.add_glob_use("app", vec!["dep".into()], UseVis::Private);
+        scope.add_glob_use("app", vec!["alias".into()], UseVis::Private);
+        assert_eq!(scope.lookup("value", "app", &[], "app").unwrap().krate, "app", "the later glob provides the local dep");
+
+        let table = std::sync::Arc::new(table);
+        let scope = MacroScope::new(table.clone());
+        let path = ["other".into()];
+        assert_eq!(scope.lookup("value", "dep", &path, "dep::facade").unwrap().krate, "first");
+        let used = scope.finish();
+        assert!(used.replays(&table, "dep", "dep.rs"));
+        let mut next = (*table).clone();
+        next.add_exp_uses("dep", [entry("other", &["second"])]);
+        let next = std::sync::Arc::new(next);
+        assert!(!used.looked[0].inputs.unchanged(&next), "the new shadow changes the lookup inputs");
+        assert!(!used.replays(&next, "dep", "dep.rs"), "the old extern result must be recomputed");
+        assert_eq!(MacroScope::new(next).lookup("value", "dep", &path, "dep::facade").unwrap().krate, "second");
     }
 
     #[test]

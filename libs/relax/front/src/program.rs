@@ -4673,10 +4673,13 @@ impl Program {
         let mut vdef = None;
         let mut src_mod: Option<u32> = None;
         if segs.len() == 1 && ((global && (edition >= 2018 || self.imports[i].ext)) || (edition >= 2018 && last_kind == SegKind::Ident)) {
-            // `use foo;` / `extern crate foo` / `use ::foo` -> extern crate, else item in scope
-            if let Some(c) = self.extern_crate(module, last) {
-                tdef = Some(self.mods[self.crates[c as usize].root_mod as usize].def);
-            } else if !global {
+            // `use ::foo` / `extern crate foo` -> extern prelude only;
+            // bare `use foo` (2018+) -> lexical scope first (respecting `import_waits`), then extern prelude.
+            if global {
+                if let Some(c) = self.extern_crate(module, last) {
+                    tdef = Some(self.mods[self.crates[c as usize].root_mod as usize].def);
+                }
+            } else {
                 tdef = self.lookup_in_scope(module, last, true);
                 vdef = if self.imports[i].bound & BOUND_SELF_ONLY != 0 { None } else { self.lookup_in_scope(module, last, false) };
             }

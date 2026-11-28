@@ -1943,11 +1943,16 @@ impl<'a> Parser<'a> {
         // Relax's built-in macros (builtins.rs) when no macro_rules! of that name is visible
         let mut full_path = mpath.clone();
         full_path.push(name.clone());
+        let qualified = qual.is_some() || path.global();
         let prelude_shadowed = STD_PRELUDE_MACROS.contains(&name.as_str())
             && (m.builtin_macro(&self.krate, &module, &full_path).is_some()
-                || (qual.is_none() && !path.global() && self.no_prelude == 0 && !self.name_imported(&name, self.pos)));
+                || (!qualified && self.no_prelude == 0 && !self.name_imported(&name, self.pos)));
         let bdef = if prelude_shadowed {
             crate::builtins::builtin_macro_def(&name)
+        } else if qualified && crate::builtins::builtin_macro_def(&name).is_some() {
+            m.reaches_builtin(&self.krate, &module, &full_path)
+                .then(|| crate::builtins::builtin_macro_def(&name))
+                .flatten()
         } else {
             let scope_krate = qual.as_deref()
                 .filter(|&q| !matches!(q, "crate" | "self" | "super" | "std" | "core" | "alloc"))

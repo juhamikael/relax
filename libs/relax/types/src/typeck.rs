@@ -8461,6 +8461,16 @@ impl<'a> Fcx<'a> {
                 None => { failed = k; break; }
             }
         }
+        if failed == n - 1 && self.tcx.validates(prog, self.file) && path.no_qself() {
+            if let Some(e) = prog.path_privacy(self.module, path.global(), &segs[..n - 1], Some(true), false, false)
+                .filter(|_| path.lo < prog.files[self.file as usize].src_len)
+            {
+                if let Some(m) = crate::lint::privacy_diag(prog, self.file, path.lo, &e) {
+                    self.err(path.lo, m);
+                    return;
+                }
+            }
+        }
         let std_module = parent.is_some_and(|d| matches!(prog.syms.str(prog.crates[prog.def(d).krate as usize].name), "core" | "std" | "alloc"));
         if failed == n - 1 && in_place && std_module {
             self.err(lo, format!("macro `{}!` is not supported", name));
