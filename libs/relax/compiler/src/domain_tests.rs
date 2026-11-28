@@ -1906,19 +1906,20 @@ fn unmapped(addr: usize) -> bool {
     unsafe {
         extern "C" {
             static mach_task_self_: u32;
-            fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut i32, count: *mut u32, object: *mut u32) -> i32;
+            fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut crate::os::mem::BasicInfo64, count: *mut u32, object: *mut u32) -> i32;
             fn mach_port_deallocate(task: u32, name: u32) -> i32;
         }
-        let (mut q, mut size, mut info, mut count, mut object) = (addr as u64, 0, [0i32; 16], 9, 0);
-        let result = mach_vm_region(mach_task_self_, &mut q, &mut size, 9, info.as_mut_ptr(), &mut count, &mut object);
+        let mut info = crate::os::mem::BasicInfo64::default();
+        let (mut q, mut size, mut count, mut object) = (addr as u64, 0, 9, 0);
+        let result = mach_vm_region(mach_task_self_, &mut q, &mut size, 9, &mut info, &mut count, &mut object);
         if object != 0 { mach_port_deallocate(mach_task_self_, object); }
         result != 0 || q > addr as u64
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
-        extern "C" { fn mincore(addr: *mut std::ffi::c_void, len: usize, vec: *mut u8) -> i32; }
+        extern "C" { fn mincore(addr: *mut u8, len: usize, vec: *mut u8) -> i32; }
         let mut resident = 0;
-        mincore(addr as *mut _, 1, &mut resident) == -1 && std::io::Error::last_os_error().raw_os_error() == Some(12)
+        mincore(addr as *mut u8, 1, &mut resident) == -1 && std::io::Error::last_os_error().raw_os_error() == Some(12)
     }
 }
 
@@ -2400,14 +2401,14 @@ fn mixed_tracked_and_untracked_pa_logs_once_and_cleans_up_probe_maps() {
     }
     static OUTSIDE: AtomicUsize = AtomicUsize::new(0);
     extern "C" fn native_alloc(size: usize) -> *mut u8 {
-        extern "C" { fn malloc(size: usize) -> *mut u8; }
-        let p = unsafe { malloc(size) };
+        extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; }
+        let p = unsafe { malloc(size) }.cast::<u8>();
         OUTSIDE.store(p as usize, Ordering::Release);
         p
     }
     extern "C" fn native_free(p: *mut u8) {
-        extern "C" { fn free(p: *mut u8); }
-        unsafe { free(p) };
+        extern "C" { fn free(p: *mut core::ffi::c_void); }
+        unsafe { free(p.cast()) };
     }
     extern "C" fn check_routing() {
         let l = Layout::from_size_align(4 << 20, 8).unwrap();

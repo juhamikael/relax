@@ -29,20 +29,24 @@ pub fn no_codegen() -> bool {
 /// The process's executable memory that no loaded image backs (macOS): (start, size, prot) per
 /// region. No-codegen mode checks it is empty when the process ends -- generated code anywhere
 /// in the process (the JIT, a kernel compiler, a library) shows up here.
+/// `VM_REGION_BASIC_INFO_64`'s buffer, as `mach_vm_region` fills it. Shared by every declaration of
+/// `mach_vm_region` in this crate, so they keep one signature.
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct BasicInfo64 {
+    protection: i32,
+    max_protection: i32,
+    inheritance: u32,
+    shared: u32,
+    reserved: u32,
+    offset: u64,
+    behavior: i32,
+    user_wired_count: u16,
+}
+
 #[cfg(target_vendor = "apple")]
 pub fn anonymous_exec_regions() -> Vec<(u64, u64, i32)> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct BasicInfo64 {
-        protection: i32,
-        max_protection: i32,
-        inheritance: u32,
-        shared: u32,
-        reserved: u32,
-        offset: u64,
-        behavior: i32,
-        user_wired_count: u16,
-    }
     use super::proc::{dladdr, DlInfo};
     extern "C" {
         fn mach_task_self() -> u32;
