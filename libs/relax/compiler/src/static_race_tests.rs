@@ -234,43 +234,46 @@ fn static_sym_at_in_rw_fast_path_skips_lock() {
     let s0_addr = owner::call(owner::Class::Program, || unsafe { (&mut *(up as *mut Unit)).static_addr(s0) });
     assert_ne!(s0_addr, 0, "S0 has no storage: {:?}", u.errors);
     let ro = u.data(&7u64.to_le_bytes(), 8, DataKind::Bytes);
-    let locked = Arc::new(Barrier::new(2));
-    let done = Arc::new(Barrier::new(2));
-
-    /// What the looking thread owes the lock holder: met on drop, also when it panics.
-    struct Owes {
-        locked: Option<Arc<Barrier>>,
-        done: Arc<Barrier>,
-    }
-    impl Drop for Owes {
-        fn drop(&mut self) {
-            if let Some(l) = self.locked.take() {
-                l.wait();
-            }
-            self.done.wait();
-        }
-    }
+    // (channels made before the lock is taken: a lookup that waits on the lock fails at the
+    // deadline instead of hanging the test, and the lock is free again before the join)
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let probing = Arc::new(AtomicUsize::new(usize::MAX));
 
     let looker = {
-        let (locked, done) = (locked.clone(), done.clone());
+        let probing = probing.clone();
         std::thread::spawn(move || {
-            let mut owes = Owes { locked: Some(locked), done };
-            if let Some(l) = owes.locked.take() {
-                l.wait();
-            }
+            locked_rx.recv().unwrap();
             let u = unsafe { &*(up as *const Unit) };
             let local = 0u64;
             let at = [0, u64::MAX, &local as *const u64 as u64, ro];
-            at.map(|a| (a, u.static_sym_at(a)))
+            let looked = std::array::from_fn::<_, 4, _>(|i| {
+                probing.store(i, Ordering::Release);
+                (at[i], u.static_sym_at(at[i]))
+            });
+            let _ = done_tx.send(looked);
         })
     };
-    u.syms.with_static_spans_locked(|| {
-        locked.wait();
-        done.wait();
+    let (received, stalled_at) = u.syms.with_static_spans_locked(|| {
+        let _ = locked_tx.send(());
+        let r = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        (r, probing.load(Ordering::Acquire))
     });
-    let looked = match looker.join() {
+    // the span lock is free now, so even a looker that waited on it unblocks and joins
+    if let Err(p) = looker.join() {
+        std::mem::forget(u);
+        std::panic::resume_unwind(p);
+    }
+    let looked = match received {
         Ok(v) => v,
-        Err(p) => std::panic::resume_unwind(p),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            std::mem::forget(u);
+            panic!("static_sym_at waited on Syms::static_spans for probe #{stalled_at}, outside the writable region (no answer in 5 s)");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::mem::forget(u);
+            panic!("the looking thread ended without its answers");
+        }
     };
     for (a, s) in looked {
         assert_eq!(s, None, "{a:#x}, outside the writable region, was attributed to a static");
