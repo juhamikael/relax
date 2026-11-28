@@ -203,7 +203,7 @@ impl PendingPlan {
             .image.outline_macros(ci)
     }
     /// The imports the outline's expansions of crate `ci` wrote, with outline_macros' plan.
-    pub(crate) fn outline_expansions(&self, ci: usize) -> Option<Arc<HashMap<(String, String), Vec<String>>>> {
+    pub(crate) fn outline_expansions(&self, ci: usize) -> Option<Arc<HashMap<(String, String), Vec<crate::macros::ExpUse>>>> {
         if let Some(uses) = std::ops::Deref::deref(self).image.outline_expansions(ci) {
             return Some(uses);
         }

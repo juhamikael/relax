@@ -1924,14 +1924,16 @@ impl Program {
             // definitions they name.
             if let Some(uses) = self.pool.as_ref().and_then(|p| p.outline_expansions(self.cur_ahead)) {
                 let known = next.exp_uses.get(&kname).cloned().unwrap_or_default();
-                let renames: Vec<((String, String), Vec<String>)> = uses.iter()
-                    .filter(|(key, to)| missing.contains(&key.1) && known.get(*key) != Some(*to))
+                let renames: Vec<_> = uses.iter()
+                    .filter(|(key, to)| missing.contains(&key.1) && known.get(*key).is_none_or(|have| to.iter().any(|u| !have.contains(u))))
                     .map(|(key, to)| (key.clone(), to.clone())).collect();
                 for (_, to) in &renames {
-                    let Some(target) = to.last() else { continue };
-                    for d in defs.iter().filter(|d| &d.name == target && d.def_file != path) {
-                        if !next.defs.get(&d.name).is_some_and(|known| known.iter().any(|k| k.krate == d.krate && k.def_file == d.def_file && k.def_pos == d.def_pos)) {
-                            next.push(d.clone());
+                    for u in to {
+                        let Some(target) = u.path.last() else { continue };
+                        for d in defs.iter().filter(|d| &d.name == target && d.def_file != path) {
+                            if !next.defs.get(&d.name).is_some_and(|known| known.iter().any(|k| k.krate == d.krate && k.def_file == d.def_file && k.def_pos == d.def_pos)) {
+                                next.push(d.clone());
+                            }
                         }
                     }
                 }

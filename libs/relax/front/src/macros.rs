@@ -155,6 +155,25 @@ pub enum UseVis {
     In(Vec<String>),
 }
 
+/// An expansion-made import recorded under its owning module and binding name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpUse {
+    pub path: Vec<String>,
+    pub vis: UseVis,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalExpUse {
+    path: Vec<Name>,
+    vis: UseVis,
+}
+
+impl LocalExpUse {
+    fn remap(&self, tr: impl Fn(Name) -> Name) -> Self {
+        Self { path: self.path.iter().copied().map(tr).collect(), vis: self.vis.clone() }
+    }
+}
+
 impl UseVis {
     pub fn is_pub(&self) -> bool { matches!(self, Self::Pub) }
     pub fn is_restricted_or_pub(&self) -> bool { !matches!(self, Self::Private) }
@@ -202,6 +221,17 @@ fn common_mod_prefix<'a>(mut a: &'a str, b: &str) -> &'a str {
 fn next_req<'a>(k: &str, m: &str, target: &str, req: Option<&'a str>) -> Option<&'a str> {
     if k != target { return None; }
     req.map(|r| common_mod_prefix(r, m)).filter(|p| !p.is_empty())
+}
+
+/// Test the import's declared visibility from the module requesting the binding.
+fn exp_vis_visible(r: &Res, ks: &str, ms: &str, vis: &UseVis, req: Option<&str>) -> bool {
+    let root = r.crate_root(ks).1;
+    let resolved = vis.ancestor(root, ms).or_else(|| {
+        let UseVis::In(path) = vis else { return None };
+        let (tk, tm) = r.resolve_mod(ks, ms, path)?;
+        (tk == ks).then(|| ScopeVis::in_ancestor(ms, tm)).flatten()
+    }).unwrap_or_else(|| ScopeVis::private(ms));
+    resolved.visible_to_req(ks, ms, ks, req)
 }
 
 impl UseVis {
@@ -505,7 +535,6 @@ impl Clone for ReplaySnapshot {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Debug)]
 pub struct Name(u32);
 
-/// `GLOB` and `GLOB_SEP`, interned first by every `MacroNames`.
 /// Set on the end of a recorded fragment group that is a `$t:ty` substitution.
 pub(crate) const TY_FRAG: u32 = 1 << 31;
 /// An `$e:expr` / `$l:literal` fragment (rustc's interpolated `NtExpr` / `NtLiteral` token): where the
@@ -529,8 +558,8 @@ pub(crate) const EMPTY_VIS: u32 = 1 << 24;
 pub(crate) const STMT_FRAG: u32 = EXPR_FRAG | LIT_FRAG;
 pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG | PATH_FRAG | WRAP_PAREN | EMPTY_VIS;
 
+/// The first name interned by every macro table.
 const GLOB_ID: Name = Name(0);
-const GLOB_SEP_ID: Name = Name(1);
 
 const NAME_SHARDS: usize = 16;
 /// Chunk c of the id -> string storage holds `64 << c` names.
@@ -552,7 +581,7 @@ impl Default for MacroNames {
             next: Default::default(),
             chunks: std::array::from_fn(|_| std::sync::OnceLock::new()),
         };
-        assert!(names.id(GLOB) == GLOB_ID && names.id(GLOB_SEP) == GLOB_SEP_ID);
+        assert!(names.id(GLOB) == GLOB_ID);
         names
     }
 }
@@ -626,7 +655,7 @@ enum LookupInput {
 enum InputValue {
     Definitions(Vec<MacroRef>),
     Prelude(Vec<String>),
-    Import(Option<Vec<String>>),
+    Import(Option<Vec<ExpUse>>),
     Present(bool),
 }
 
@@ -754,7 +783,7 @@ pub struct MacroTable {
     pub s2_fmt: bool,
     /// per crate: `use` bindings parses of its files made, macro expansions' included (module,
     /// bound name, path) -- what the prescan's scopes cannot know (MacroScope::lookup)
-    pub exp_uses: HashMap<String, std::sync::Arc<crate::fxhash::HashMap<(String, String), Vec<String>>>>,
+    pub exp_uses: HashMap<String, std::sync::Arc<crate::fxhash::HashMap<(String, String), Vec<ExpUse>>>>,
     /// crates whose load finished (seal_crate): their scopes see every import they will have
     pub sealed: crate::fxhash::HashSet<String>,
     type_snapshot: TypeSnapshot,
@@ -880,7 +909,7 @@ impl MacroTable {
 
     /// A parse's `use` bindings (MacroUse::uses) join crate `k`'s expansion-made imports (glob
     /// entries merge).
-    pub fn add_exp_uses(&mut self, k: &str, uses: impl IntoIterator<Item = ((String, String), Vec<String>)>) {
+    pub fn add_exp_uses(&mut self, k: &str, uses: impl IntoIterator<Item = ((String, String), Vec<ExpUse>)>) {
         self.replay_snapshot.0.get_mut().unwrap().clear();
         self.import_snapshot.0.get_mut().unwrap().clear();
         let t = std::sync::Arc::make_mut(self.exp_uses.entry(k.to_string()).or_default());
@@ -891,19 +920,19 @@ impl MacroTable {
         let crates = self.expansion_snapshot.crates.get_mut().unwrap();
         let mut index = crates.get_mut(k).map(std::sync::Arc::make_mut);
         let aliases = self.expansion_snapshot.aliases.get_mut().unwrap();
-        for (key, path) in uses {
+        for (key, entries) in uses {
             if let Some(index) = index.as_mut() {
                 if !index.names.contains(&key.1) { index.names.insert(key.1.clone()); }
                 add_import_module(&mut index.modules, &key.0);
             }
             if let Some(found) = aliases.get_mut(&key.1) { *found = true; }
-            if key.1 == GLOB {
-                let e = t.entry(key).or_default();
-                for g in split_globs(&path) {
-                    push_glob(e, g);
+            let stored = t.entry(key).or_default();
+            for entry in entries {
+                if stored.last() == Some(&entry) { continue; }
+                if let Some(pos) = stored.iter().position(|u| u == &entry) {
+                    stored.remove(pos);
                 }
-            } else {
-                t.insert(key, path);
+                stored.push(entry);
             }
         }
     }
@@ -968,9 +997,9 @@ impl MacroTable {
         let mut renames = old.renames.clone();
         let mut mods = old.mods.clone();
         let mut externs = old.externs.clone();
-        let mut binds: Vec<(&(String, String), &Vec<String>)> = eu.into_iter().flat_map(|u| u.iter()).collect();
-        binds.sort();
-        for ((m, b), path) in binds {
+        let mut binds: Vec<_> = eu.into_iter().flat_map(|u| u.iter()).collect();
+        binds.sort_by(|a, b| a.0.cmp(b.0));
+        for ((m, b), entries) in binds {
             // Glob-only generated modules need their parent bindings too.
             let mut p = m.as_str();
             while p.len() > old.root.len() && mods.insert(p.to_string()) {
@@ -981,30 +1010,21 @@ impl MacroTable {
                 }
             }
             let v = uses.entry(m.clone()).or_default();
-            if b == GLOB {
-                for g in split_globs(path) {
-                    if !v.iter().any(|u| u.bind.is_none() && u.path == g) {
-                        v.push(UseItem { module: m.clone(), path: g, bind: None, vis: UseVis::Pub });
-                        added = true;
+            for entry in entries {
+                let path = &entry.path;
+                let bind = (b != GLOB).then_some(b.as_str());
+                if bind.is_some() && m == &old.root {
+                    if path.len() == 1 && path[0] == "crate" {
+                        externs.insert(b.clone(), k.to_string());
+                    } else if path.len() == 2 && path[0].is_empty() {
+                        if let Some(target) = extern_target(&externs, &path[1]) { externs.insert(b.clone(), target); }
                     }
                 }
-                continue;
+                if v.iter().any(|u| u.bind.as_deref() == bind && &u.path == path && u.vis == entry.vis) { continue; }
+                v.push(UseItem { module: m.clone(), path: path.clone(), bind: bind.map(str::to_owned), vis: entry.vis.clone() });
+                if bind.is_some() && path.last() != Some(b) { renames.insert(b.clone()); }
+                added = true;
             }
-            if m == &old.root {
-                if path.len() == 1 && path[0] == "crate" {
-                    externs.insert(b.clone(), k.to_string());
-                } else if path.len() == 2 && path[0].is_empty() {
-                    if let Some(target) = extern_target(&externs, &path[1]) { externs.insert(b.clone(), target); }
-                }
-            }
-            if v.iter().any(|u| u.bind.as_deref() == Some(b.as_str()) && &u.path == path) {
-                continue;
-            }
-            v.push(UseItem { module: m.clone(), path: path.clone(), bind: Some(b.clone()), vis: UseVis::Pub });
-            if path.last() != Some(b) {
-                renames.insert(b.clone());
-            }
-            added = true;
         }
         if !added {
             return;
@@ -1021,27 +1041,8 @@ impl MacroTable {
     }
 }
 
-/// The bind name under which a module's expansion-made glob imports are recorded (never an
-/// identifier), and the separator between their paths.
+/// The binding name for expansion-made glob imports.
 pub const GLOB: &str = "*";
-const GLOB_SEP: &str = "\u{0}";
-
-fn push_glob(v: &mut Vec<String>, path: Vec<String>) {
-    if split_globs(v).contains(&path) {
-        return;
-    }
-    if !v.is_empty() {
-        v.push(GLOB_SEP.to_string());
-    }
-    v.extend(path);
-}
-
-fn split_globs(v: &[String]) -> Vec<Vec<String>> {
-    if v.is_empty() {
-        return Vec::new();
-    }
-    v.split(|s| s == GLOB_SEP).map(|p| p.to_vec()).collect()
-}
 
 /// The definition `path::name!` names in module `module` of crate `cur`, seeing `table` and the
 /// parse's own definitions so far (`local`), as rustc_resolve (ident.rs visit_scopes, MacroNS):
@@ -1803,7 +1804,7 @@ pub struct MacroScope {
     /// Initial bindings, then each changed entry's value after the write. Lookups
     /// record a journal position, so interleaved imports do not copy the whole map.
     uses_base: std::sync::Arc<LocalImports>,
-    uses_log: std::cell::RefCell<Vec<((Name, Name), Vec<Name>)>>,
+    uses_log: std::cell::RefCell<Vec<((Name, Name), Vec<LocalExpUse>)>>,
     memo: std::cell::RefCell<LookupMemo>,
     forwarders: std::cell::RefCell<HashMap<(String, String, String), MacroRef>>,
     /// `builtin_macro`'s answers, by (crate, module, path), for the table they were read from
@@ -1816,7 +1817,7 @@ pub struct MacroScope {
 /// Names are ids of the owning table's `MacroNames`.
 #[derive(Default)]
 struct LocalImports {
-    bindings: HashMap<(Name, Name), Vec<Name>>,
+    bindings: HashMap<(Name, Name), Vec<LocalExpUse>>,
     index: std::sync::OnceLock<LocalImportIndex>,
 }
 
@@ -1845,7 +1846,7 @@ impl LocalImports {
             LocalImportIndex { names: self.bindings.keys().map(|&(_, b)| b).collect(), modules }
         })
     }
-    fn entry(&mut self, names: &MacroNames, key: (Name, Name)) -> &mut Vec<Name> {
+    fn entry(&mut self, names: &MacroNames, key: (Name, Name)) -> &mut Vec<LocalExpUse> {
         if let Some(index) = self.index.get_mut() {
             index.names.insert(key.1);
             add_import_module_id(&mut index.modules, names, key.0);
@@ -1856,28 +1857,9 @@ impl LocalImports {
     fn remap(&self, from: &MacroNames, to: &MacroNames) -> Self {
         let tr = |n: Name| to.id(from.str(n));
         Self {
-            bindings: self.bindings.iter().map(|(&(m, b), p)| ((tr(m), tr(b)), p.iter().map(|&x| tr(x)).collect())).collect(),
+            bindings: self.bindings.iter().map(|(&(m, b), p)| ((tr(m), tr(b)), p.iter().map(|u| u.remap(tr)).collect())).collect(),
             index: Default::default(),
         }
-    }
-}
-
-/// The paths of a module's glob imports, one entry (separated by GLOB_SEP_ID).
-fn push_glob_ids(v: &mut Vec<Name>, path: Vec<Name>) {
-    if !v.is_empty() && v.split(|&s| s == GLOB_SEP_ID).any(|p| p == path) {
-        return;
-    }
-    if !v.is_empty() {
-        v.push(GLOB_SEP_ID);
-    }
-    v.extend(path);
-}
-
-/// `paths` (a GLOB entry) joins `out`, each path once.
-fn add_globs_ids(out: &mut Vec<Vec<Name>>, paths: &[Name]) {
-    if paths.is_empty() { return; }
-    for path in paths.split(|&s| s == GLOB_SEP_ID) {
-        if !out.iter().any(|o| o == path) { out.push(path.to_vec()); }
     }
 }
 
@@ -1947,11 +1929,11 @@ pub struct MacroUse {
     pub local: Vec<MacroRef>,
     looked: Vec<Looked>,
     uses_base: std::sync::Arc<LocalImports>,
-    uses_log: Vec<((Name, Name), Vec<Name>)>,
+    uses_log: Vec<((Name, Name), Vec<LocalExpUse>)>,
     /// the interner `looked`, `uses_base` and `uses_log` are in (None: an image's, nothing to replay)
     names: Option<std::sync::Arc<MacroNames>>,
     /// the parse's `use` bindings (MacroScope::add_use), for the crate's table
-    pub uses: crate::fxhash::HashMap<(String, String), Vec<String>>,
+    pub uses: crate::fxhash::HashMap<(String, String), Vec<ExpUse>>,
     /// decoded from a file image's replay data (from_replay): those bytes, recorded again as they are
     replay_image: Option<std::sync::Arc<[u8]>>,
 }
@@ -2017,26 +1999,28 @@ impl MacroScope {
     }
 
     /// `use path as bind;` (or `use path;`) parsed in module `module`.
-    pub fn add_use(&self, module: &str, bind: String, path: Vec<String>) {
+    pub fn add_use(&self, module: &str, bind: String, path: Vec<String>, vis: UseVis) {
         let names = &*self.table.names;
         let key = (names.id(module), names.id(&bind));
-        let path: Vec<Name> = path.iter().map(|p| names.id(p)).collect();
-        if self.local_uses.borrow().bindings.get(&key) == Some(&path) { return; }
-        self.uses_log.borrow_mut().push((key, path.clone()));
-        *std::sync::Arc::make_mut(&mut self.local_uses.borrow_mut()).entry(names, key) = path;
+        let entry = LocalExpUse { path: path.iter().map(|p| names.id(p)).collect(), vis };
+        if self.local_uses.borrow().bindings.get(&key).is_some_and(|v| v.last() == Some(&entry)) { return; }
+        let mut uses = self.local_uses.borrow_mut();
+        let v = std::sync::Arc::make_mut(&mut uses).entry(names, key);
+        if let Some(pos) = v.iter().position(|u| u == &entry) { v.remove(pos); }
+        v.push(entry);
+        self.uses_log.borrow_mut().push((key, v.clone()));
         *self.memo.borrow_mut() = LookupMemo::default();
     }
 
-    /// `use path::*;` parsed in module `module`: kept under the bind name GLOB, the paths of all
-    /// of the module's glob imports in one entry (separated by GLOB_SEP).
-    pub fn add_glob_use(&self, module: &str, path: Vec<String>) {
+    /// A glob import parsed in this module. The same path may have several visibilities.
+    pub fn add_glob_use(&self, module: &str, path: Vec<String>, vis: UseVis) {
         let names = &*self.table.names;
         let key = (names.id(module), GLOB_ID);
-        let path: Vec<Name> = path.iter().map(|p| names.id(p)).collect();
-        if self.local_uses.borrow().bindings.get(&key).is_some_and(|v| v.split(|&s| s == GLOB_SEP_ID).any(|p| p == path)) { return; }
+        let entry = LocalExpUse { path: path.iter().map(|p| names.id(p)).collect(), vis };
+        if self.local_uses.borrow().bindings.get(&key).is_some_and(|v| v.contains(&entry)) { return; }
         let mut uses = self.local_uses.borrow_mut();
         let v = std::sync::Arc::make_mut(&mut uses).entry(names, key);
-        push_glob_ids(v, path);
+        v.push(entry);
         self.uses_log.borrow_mut().push((key, v.clone()));
         *self.memo.borrow_mut() = LookupMemo::default();
     }
@@ -2103,16 +2087,26 @@ impl MacroScope {
             return true;
         }
         let Some((k, m)) = at else { return false };
-        if k != cur {
-            return false;
-        }
+        if k != cur { return false; }
+        let r = Res { table: &self.table };
+        let req = Some(module);
         let names = &*self.table.names;
         let mid = names.id(&m);
         let local = self.local_uses.borrow();
-        if local.bindings.contains_key(&(mid, names.id(name))) || local.bindings.contains_key(&(mid, GLOB_ID)) {
+        let any_local = |v: &[LocalExpUse]| v.iter().any(|u| exp_vis_visible(&r, &k, &m, &u.vis, req));
+        let any_exp = |v: &[ExpUse]| v.iter().any(|u| exp_vis_visible(&r, &k, &m, &u.vis, req));
+        if local.bindings.get(&(mid, names.id(name))).is_some_and(|v| any_local(v))
+            || self.table.exp_uses.get(cur).and_then(|t| t.get(&(m.clone(), name.to_string()))).is_some_and(|v| any_exp(v))
+        {
             return true;
         }
-        self.table.exp_uses.get(cur).is_some_and(|t| t.contains_key(&(m.clone(), name.to_string())) || t.contains_key(&(m, GLOB.to_string())))
+        if r.scope(&k).is_some_and(|sc| {
+            sc.mnon.get(&m).and_then(|t| t.get(name)).is_some_and(|(_, v)| !v.visible_to_req(&k, &m, &k, req))
+        }) {
+            return false;
+        }
+        local.bindings.get(&(mid, GLOB_ID)).is_some_and(|v| any_local(v))
+            || self.table.exp_uses.get(cur).and_then(|t| t.get(&(m.clone(), GLOB.to_string()))).is_some_and(|v| any_exp(v))
     }
 
     /// An explicit binding, or an attribute exported through a glob. The outer Option keeps
@@ -2316,7 +2310,12 @@ impl MacroScope {
     pub fn finish(self) -> MacroUse {
         let names = self.table.names.clone();
         let uses = std::sync::Arc::unwrap_or_clone(self.local_uses.into_inner()).bindings.into_iter()
-            .map(|((m, b), p)| ((names.str(m).to_string(), names.str(b).to_string()), p.iter().map(|&x| names.str(x).to_string()).collect()))
+            .map(|((m, b), entries)| {
+                let entries = entries.into_iter().map(|u| ExpUse {
+                    path: u.path.into_iter().map(|n| names.str(n).to_owned()).collect(), vis: u.vis,
+                }).collect();
+                ((names.str(m).to_owned(), names.str(b).to_owned()), entries)
+            })
             .collect();
         MacroUse { trusted_image: false, local: self.local, looked: self.looked.into_inner(), uses_base: self.uses_base, uses_log: self.uses_log.into_inner(), names: Some(names), uses, replay_image: None }
     }
@@ -2444,22 +2443,51 @@ impl ImportLookup<'_> {
         Some(at)
     }
 
-    fn binding(&mut self, k: Name, m: Name, n: Name, req: Option<&str>) -> Option<Vec<Name>> {
+    /// Visible single imports, latest first, and hidden expansion-made paths that may shadow a glob.
+    fn bindings(&mut self, k: Name, m: Name, n: Name, req: Option<&str>) -> (Vec<Vec<Name>>, Vec<Vec<Name>>) {
         let key = (m, n);
         let scope = self.scope;
         let mine = scope.local_uses.borrow();
         let table = &scope.table;
         let names = &*table.names;
-        if k == self.origin { if let Some(path) = mine.bindings.get(&key) { return Some(path.clone()); } }
-        self.inputs.read(table, LookupInput::Import(k, m, n));
+        let r = Res { table };
         let (ks, ms, ns) = (names.str(k), names.str(m), names.str(n));
-        let ids = |path: &Vec<String>| path.iter().map(|s| names.id(s)).collect::<Vec<Name>>();
-        table.exp_uses.get(ks).and_then(|u| u.get(&(ms.to_string(), ns.to_string()))).map(ids)
-            .or_else(|| {
-                let cm = table.crates.get(ks)?;
-                cm.uses.get(ms)?.iter().rev().find(|u| u.bind.as_deref() == Some(ns)
-                    && u.vis.resolve(&cm.root, ms).visible_to_req(ks, ms, ks, req)).map(|u| ids(&u.path))
-            })
+        let mut visible = Vec::new();
+        let mut hidden = Vec::new();
+        let push_unique = |dst: &mut Vec<Vec<Name>>, path: Vec<Name>| {
+            if !dst.contains(&path) { dst.push(path); }
+        };
+        if k == self.origin {
+            if let Some(entries) = mine.bindings.get(&key) {
+                for u in entries.iter().rev() {
+                    if exp_vis_visible(&r, ks, ms, &u.vis, req) {
+                        push_unique(&mut visible, u.path.clone());
+                    } else {
+                        push_unique(&mut hidden, u.path.clone());
+                    }
+                }
+            }
+        }
+        self.inputs.read(table, LookupInput::Import(k, m, n));
+        let ids = |path: &[String]| path.iter().map(|s| names.id(s)).collect::<Vec<Name>>();
+        if let Some(entries) = table.exp_uses.get(ks).and_then(|u| u.get(&(ms.to_string(), ns.to_string()))) {
+            for u in entries.iter().rev() {
+                let path = ids(&u.path);
+                if exp_vis_visible(&r, ks, ms, &u.vis, req) {
+                    push_unique(&mut visible, path);
+                } else {
+                    push_unique(&mut hidden, path);
+                }
+            }
+        }
+        if let Some(cm) = table.crates.get(ks) {
+            for u in cm.uses.get(ms).into_iter().flatten().rev() {
+                if u.bind.as_deref() == Some(ns) && exp_vis_visible(&r, ks, ms, &u.vis, req) {
+                    push_unique(&mut visible, ids(&u.path));
+                }
+            }
+        }
+        (visible, hidden)
     }
 
     fn globs(&mut self, k: Name, m: Name, req: Option<&str>) -> Vec<Vec<Name>> {
@@ -2468,22 +2496,116 @@ impl ImportLookup<'_> {
         let mine = scope.local_uses.borrow();
         let table = &scope.table;
         let names = &*table.names;
+        let r = Res { table };
         self.inputs.read(table, LookupInput::Import(k, m, GLOB_ID));
         let (ks, ms) = (names.str(k), names.str(m));
         let ids = |path: &[String]| path.iter().map(|s| names.id(s)).collect::<Vec<Name>>();
         let mut out = Vec::new();
-        if k == self.origin { if let Some(paths) = mine.bindings.get(&key) { add_globs_ids(&mut out, paths); } }
-        if let Some(paths) = table.exp_uses.get(ks).and_then(|u| u.get(&(ms.to_string(), GLOB.to_string()))) {
-            add_globs_ids(&mut out, &ids(paths));
+        let mut push_unique = |path: Vec<Name>| {
+            if !out.contains(&path) { out.push(path); }
+        };
+        if k == self.origin {
+            for u in mine.bindings.get(&key).into_iter().flatten() {
+                if exp_vis_visible(&r, ks, ms, &u.vis, req) { push_unique(u.path.clone()); }
+            }
+        }
+        if let Some(entries) = table.exp_uses.get(ks).and_then(|u| u.get(&(ms.to_string(), GLOB.to_string()))) {
+            for u in entries {
+                if exp_vis_visible(&r, ks, ms, &u.vis, req) { push_unique(ids(&u.path)); }
+            }
         }
         if let Some(cm) = table.crates.get(ks) {
             for u in cm.uses.get(ms).into_iter().flatten().filter(|u| u.bind.is_none()
-                && u.vis.resolve(&cm.root, ms).visible_to_req(ks, ms, ks, req)) {
-                let path = ids(&u.path);
-                if !out.contains(&path) { out.push(path); }
+                && exp_vis_visible(&r, ks, ms, &u.vis, req)) {
+                push_unique(ids(&u.path));
             }
         }
         out
+    }
+
+    fn resolve_module_binding(&mut self, k: Name, m: Name, path: &[Name], req: Option<&str>, parent: Option<usize>) -> Option<ImportValue> {
+        let table = &self.scope.table;
+        let names = &*table.names;
+        let (ks, ms) = (names.str(k), names.str(m));
+        let r = Res { table };
+        let (&last, prefix) = path.split_last()?;
+        let leaf = names.str(last);
+        let absolute = matches!(prefix, [root] if names.str(*root).is_empty());
+        let extern_leaf = (prefix.is_empty() || absolute) && r.extern_crate(ks, leaf).is_some();
+        if matches!(leaf, "crate" | "self" | "super") || leaf.starts_with("__relax_crate_") || extern_leaf {
+            return self.path(k, m, path, parent).map(|(k, m)| ImportValue::Module(k, m));
+        }
+        let (tk, tm) = self.path(k, m, prefix, parent)?;
+        let next = next_req(ks, ms, names.str(tk), req).map(|p| names.id(p));
+        self.ask(ImportNs::Module, tk, tm, last, next, parent)
+    }
+
+    fn resolve_macro_binding(&mut self, k: Name, m: Name, path: &[Name], req: Option<&str>, parent: Option<usize>) -> Option<ImportValue> {
+        let scope = self.scope;
+        let table = &scope.table;
+        let names = &*table.names;
+        let (ks, ms) = (names.str(k), names.str(m));
+        let r = Res { table };
+        let (&last, prefix) = path.split_last()?;
+        if prefix.is_empty() {
+            self.inputs.read(table, LookupInput::Definitions(last));
+            self.inputs.read(table, LookupInput::Prelude(k));
+            let last_s = names.str(last);
+            let cm = table.crates.get(ks);
+            let local = if k == self.origin { &scope.local[..] } else { &[] };
+            if let Some(d) = table.defs.get(last_s).map_or(&[][..], |v| &v[..]).iter()
+                .chain(local.iter().filter(|d| d.name == last_s)).rev()
+                .find(|d| d.krate == krate_name(ks) && cm.map_or(true, |c| c.in_textual_scope(d, ms, None)))
+                .filter(|d| d.exported || req.is_some())
+            {
+                return Some(ImportValue::Macro(d.clone()));
+            }
+            let inner_req = next_req(ks, ms, ks, req);
+            if let Some(d) = r.macro_in_vis(ks, inner_req, ks, ms, last_s).map(|(d, _)| d)
+                .or_else(|| table.macro_use.get(ks).and_then(|us| us.iter().rev().find_map(|u| {
+                    let uk = cm.and_then(|c| c.externs.get(u.as_str())).map_or(u.as_str(), |s| s.as_str());
+                    r.exported_in(uk, r.crate_root(uk).1, last_s)
+                })))
+                .or_else(|| r.std_prelude(last_s))
+            {
+                return Some(ImportValue::Macro(d));
+            }
+        }
+        let (tk, tm) = self.path(k, m, prefix, parent)?;
+        let next = next_req(ks, ms, names.str(tk), req).map(|p| names.id(p));
+        self.ask(ImportNs::Macro, tk, tm, last, next, parent)
+    }
+
+    /// A hidden expansion-made single shadows globs only in the namespace it binds.
+    fn hidden_binding_shadows(&mut self, ns: ImportNs, k: Name, m: Name, path: &[Name]) -> bool {
+        let scope = self.scope;
+        let table = &scope.table;
+        let names = &*table.names;
+        let (ks, ms) = (names.str(k), names.str(m));
+        let r = Res { table };
+        match ns {
+            ImportNs::Module => with_strs(names, path, |ps| r.resolve_mod(ks, ms, ps).is_some()),
+            ImportNs::Macro => {
+                let Some((&last, prefix)) = path.split_last() else { return false };
+                let last_s = names.str(last);
+                if prefix.is_empty() {
+                    self.inputs.read(table, LookupInput::Definitions(last));
+                    self.inputs.read(table, LookupInput::Prelude(k));
+                    let local = if k == self.origin { &scope.local[..] } else { &[] };
+                    return lookup_in(table, local, last_s, ks, &[] as &[&str], ms).is_some();
+                }
+                with_strs(names, prefix, |ps| {
+                    let (tk, tm) = r.resolve_mod(ks, ms, ps)?;
+                    if tk == ks && k == self.origin && r.crate_root(tk).1 == tm
+                        && scope.local.iter().any(|d| d.exported && d.krate == krate_name(ks) && d.name == last_s)
+                    {
+                        return Some(());
+                    }
+                    r.macro_in(ks, ms, tk, tm, last_s).map(|_| ())
+                        .or_else(|| matches!(tk, "std" | "core" | "alloc").then(|| r.std_prelude(last_s)).flatten().map(|_| ()))
+                }).is_some()
+            }
+        }
     }
 
     /// Exactly the generated modules and their parents that seal_crate will publish. A
@@ -2531,33 +2653,15 @@ impl ImportLookup<'_> {
                 }
             }
         }
-        if let Some(path) = self.binding(k, m, n, req) {
-            let (&last, prefix) = path.split_last()?;
-            return match ns {
-                ImportNs::Module => {
-                    let leaf = names.str(last);
-                    let absolute = matches!(prefix, [root] if names.str(*root).is_empty());
-                    let extern_leaf = (prefix.is_empty() || absolute) && r.extern_crate(ks, leaf).is_some();
-                    if matches!(leaf, "crate" | "self" | "super") || leaf.starts_with("__relax_crate_") || extern_leaf {
-                        return self.path(k, m, &path, Some(i)).map(|(k, m)| ImportValue::Module(k, m));
-                    }
-                    let (tk, tm) = self.path(k, m, prefix, Some(i))?;
-                    self.ask(ns, tk, tm, last, next(tk), Some(i))
-                }
-                ImportNs::Macro => {
-                    if prefix.is_empty() && req.is_some_and(|asker| within(asker, ms)) {
-                        self.inputs.read(table, LookupInput::Definitions(last));
-                        self.inputs.read(table, LookupInput::Prelude(k));
-                        let local = if k == self.origin { &scope.local[..] } else { &[] };
-                        if let Some(d) = lookup_in(table, local, names.str(last), ks, &[] as &[&str], ms) {
-                            return Some(ImportValue::Macro(d));
-                        }
-                    }
-                    let (k, m) = self.path(k, m, prefix, Some(i))?;
-                    self.ask(ns, k, m, last, next(k), Some(i))
-                }
+        let (visible, hidden) = self.bindings(k, m, n, req);
+        for path in visible {
+            let found = match ns {
+                ImportNs::Module => self.resolve_module_binding(k, m, &path, req, Some(i)),
+                ImportNs::Macro => self.resolve_macro_binding(k, m, &path, req, Some(i)),
             };
+            if let Some(value) = found { return Some(value); }
         }
+        if hidden.iter().any(|path| self.hidden_binding_shadows(ns, k, m, path)) { return None; }
         for path in self.globs(k, m, req) {
             if let Some((k, m)) = self.path(k, m, &path, Some(i)) {
                 if let Some(value) = self.ask(ns, k, m, n, next(k), Some(i)) { return Some(value); }
@@ -2605,7 +2709,7 @@ impl ImportLookup<'_> {
 }
 
 impl MacroUse {
-    pub fn from_image(local: Vec<MacroRef>, uses: crate::fxhash::HashMap<(String, String), Vec<String>>) -> Self {
+    pub fn from_image(local: Vec<MacroRef>, uses: crate::fxhash::HashMap<(String, String), Vec<ExpUse>>) -> Self {
         Self { local, uses, looked: Vec::new(), uses_base: Default::default(), uses_log: Vec::new(), names: None, trusted_image: true, replay_image: None }
     }
 
@@ -2651,12 +2755,20 @@ impl MacroUse {
                 }
             }
         }
-        let mut bindings = |w: &mut Vec<u8>, strs: &mut Vec<String>, it: &mut dyn Iterator<Item = (&(Name, Name), &Vec<Name>)>, n: usize| {
+        let mut bindings = |w: &mut Vec<u8>, strs: &mut Vec<String>, it: &mut dyn Iterator<Item = (&(Name, Name), &Vec<LocalExpUse>)>, n: usize| {
             put(w, n as u32);
-            for ((m, b), path) in it {
+            for ((m, b), entries) in it {
                 put(w, id(*m, strs)); put(w, id(*b, strs));
-                put(w, path.len() as u32);
-                for &p in path { put(w, id(p, strs)); }
+                put(w, entries.len() as u32);
+                for u in entries {
+                    put(w, u.path.len() as u32);
+                    for &p in &u.path { put(w, id(p, strs)); }
+                    w.push(u.vis.tag());
+                    if let UseVis::In(path) = &u.vis {
+                        put(w, path.len() as u32);
+                        for p in path { put_s(w, p); }
+                    }
+                }
             }
         };
         bindings(&mut w, &mut strs, &mut self.uses_base.bindings.iter(), self.uses_base.bindings.len());
@@ -2671,7 +2783,7 @@ impl MacroUse {
     /// An image's lookups (`local` and `uses` as from_image) with its replay data
     /// (replay_bytes): replayed against the loader's table like a speculative parse's, the
     /// answers compared by what their expansions depend on. None: the data does not decode.
-    pub fn from_replay(local: Vec<MacroRef>, uses: crate::fxhash::HashMap<(String, String), Vec<String>>, bytes: &[u8]) -> Option<Self> {
+    pub fn from_replay(local: Vec<MacroRef>, uses: crate::fxhash::HashMap<(String, String), Vec<ExpUse>>, bytes: &[u8]) -> Option<Self> {
         struct R<'a>(&'a [u8]);
         impl<'a> R<'a> {
             fn take(&mut self, n: usize) -> Option<&'a [u8]> { let x = self.0.get(..n)?; self.0 = &self.0[n..]; Some(x) }
@@ -2707,14 +2819,25 @@ impl MacroUse {
             };
             looked.push(Looked { name: nm, path, module, nlocal, nuses, got: None, inputs: inputs.clone(), was: Some(was) });
         }
-        let bindings = |r: &mut R| -> Option<Vec<((Name, Name), Vec<Name>)>> {
+        let bindings = |r: &mut R| -> Option<Vec<((Name, Name), Vec<LocalExpUse>)>> {
             let n = r.u32()? as usize;
             if n > bytes.len() { return None; }
             (0..n).map(|_| {
                 let k = (name(r)?, name(r)?);
-                let np = r.u32()? as usize;
-                if np > bytes.len() { return None; }
-                Some((k, (0..np).map(|_| name(r)).collect::<Option<Vec<_>>>()?))
+                let ne = r.u32()? as usize;
+                if ne > bytes.len() { return None; }
+                let entries = (0..ne).map(|_| {
+                    let np = r.u32()? as usize;
+                    if np > bytes.len() { return None; }
+                    let path = (0..np).map(|_| name(r)).collect::<Option<_>>()?;
+                    let vis = UseVis::from_tag(r.take(1)?[0], || {
+                        let nv = r.u32()? as usize;
+                        if nv > bytes.len() { return None; }
+                        (0..nv).map(|_| Some(r.str()?.to_owned())).collect()
+                    })?;
+                    Some(LocalExpUse { path, vis })
+                }).collect::<Option<_>>()?;
+                Some((k, entries))
             }).collect()
         };
         let base = bindings(&mut r)?;
@@ -2755,8 +2878,8 @@ impl MacroUse {
                 // entry is applied once, and a later import never reaches back.
                 if applied != l.nuses as usize {
                     let uses = std::sync::Arc::make_mut(scope.local_uses.get_mut());
-                    for (key, path) in &self.uses_log[applied..l.nuses as usize] {
-                        *uses.entry(names, (tr(key.0), tr(key.1))) = path.iter().map(|&p| tr(p)).collect();
+                    for (key, entries) in &self.uses_log[applied..l.nuses as usize] {
+                        *uses.entry(names, (tr(key.0), tr(key.1))) = entries.iter().map(|u| u.remap(tr)).collect();
                     }
                     applied = l.nuses as usize;
                 }
@@ -4532,9 +4655,9 @@ mod replay_tests {
         table.push(definition("second", "two"));
         let table = std::sync::Arc::new(table);
         let scope = MacroScope::new(table.clone());
-        scope.add_use("app", "runtime".into(), vec!["first".into()]);
+        scope.add_use("app", "runtime".into(), vec!["first".into()], UseVis::Private);
         assert!(scope.lookup("value", "app", &["runtime".into()], "app").is_some());
-        scope.add_use("app", "runtime".into(), vec!["second".into()]);
+        scope.add_use("app", "runtime".into(), vec!["second".into()], UseVis::Private);
         assert!(scope.lookup("value", "app", &["runtime".into()], "app").is_some());
         let used = scope.finish();
         assert!(used.replays(&table, "app", "app.rs"));
@@ -4550,7 +4673,7 @@ mod replay_tests {
         table.push(definition("dep", "one"));
         let table = std::sync::Arc::new(table);
         let scope = MacroScope::new(table.clone());
-        scope.add_glob_use("app", vec!["dep".into()]);
+        scope.add_glob_use("app", vec!["dep".into()], UseVis::Private);
         assert!(scope.lookup("value", "app", &[], "app").is_some());
         assert!(scope.finish().replays(&table, "app", "app.rs"));
     }
@@ -4560,7 +4683,7 @@ mod replay_tests {
         let mut table = macro_table();
         table.push(definition("first", "one"));
         table.push(definition("second", "two"));
-        table.add_exp_uses("app", [(("app::generated".into(), "selected".into()), vec!["first".into(), "value".into()])]);
+        table.add_exp_uses("app", [(("app::generated".into(), "selected".into()), vec![ExpUse { path: vec!["first".into(), "value".into()], vis: UseVis::Pub }])]);
         let table = std::sync::Arc::new(table);
         let scope = MacroScope::new(table.clone());
         let path = ["crate".into(), "generated".into()];
@@ -4569,17 +4692,17 @@ mod replay_tests {
         let used = scope.finish();
 
         let mut next = (*table).clone();
-        next.add_exp_uses("app", [(("app::other".into(), "unrelated".into()), vec!["second".into(), "value".into()])]);
+        next.add_exp_uses("app", [(("app::other".into(), "unrelated".into()), vec![ExpUse { path: vec!["second".into(), "value".into()], vis: UseVis::Pub }])]);
         assert!(used.looked.iter().all(|l| l.inputs.unchanged(&next)));
         assert!(used.replays(&std::sync::Arc::new(next.clone()), "app", "app.rs"));
 
         // Invalidate a cached validation on the same mutable publication too.
-        next.add_exp_uses("app", [(("app::generated".into(), "selected".into()), vec!["second".into(), "value".into()])]);
+        next.add_exp_uses("app", [(("app::generated".into(), "selected".into()), vec![ExpUse { path: vec!["second".into(), "value".into()], vis: UseVis::Pub }])]);
         assert!(!used.looked[0].inputs.unchanged(&next));
         assert!(!used.replays(&std::sync::Arc::new(next), "app", "app.rs"));
 
         let mut next = (*table).clone();
-        next.add_exp_uses("app", [(("app::generated".into(), "absent".into()), vec!["first".into(), "value".into()])]);
+        next.add_exp_uses("app", [(("app::generated".into(), "absent".into()), vec![ExpUse { path: vec!["first".into(), "value".into()], vis: UseVis::Pub }])]);
         assert!(!used.looked[1].inputs.unchanged(&next));
         assert!(!used.replays(&std::sync::Arc::new(next), "app", "app.rs"));
     }
@@ -4591,11 +4714,11 @@ mod replay_tests {
         let table = std::sync::Arc::new(table);
         let scope = MacroScope::new(table.clone());
         for i in 0..16 {
-            scope.add_use("app::generated", format!("alias{i}"), vec!["self".into(), format!("alias{}", i + 1)]);
+            scope.add_use("app::generated", format!("alias{i}"), vec!["self".into(), format!("alias{}", i + 1)], UseVis::Pub);
         }
-        scope.add_use("app::generated", "alias16".into(), vec!["dep".into(), "value".into()]);
-        scope.add_use("app::generated", "cycle_a".into(), vec!["self".into(), "cycle_b".into()]);
-        scope.add_use("app::generated", "cycle_b".into(), vec!["self".into(), "cycle_a".into()]);
+        scope.add_use("app::generated", "alias16".into(), vec!["dep".into(), "value".into()], UseVis::Pub);
+        scope.add_use("app::generated", "cycle_a".into(), vec!["self".into(), "cycle_b".into()], UseVis::Pub);
+        scope.add_use("app::generated", "cycle_b".into(), vec!["self".into(), "cycle_a".into()], UseVis::Pub);
         let path = ["crate".into(), "generated".into()];
         assert!(scope.lookup("alias0", "app", &path, "app::nested").is_some());
         assert!(scope.lookup("cycle_a", "app", &path, "app::nested").is_none());
@@ -4611,9 +4734,9 @@ mod replay_tests {
         table.define(unreachable);
         let table = std::sync::Arc::new(table);
         let scope = MacroScope::new(table.clone());
-        scope.add_glob_use("app", vec!["self".into(), "lib_rr".into()]);
-        scope.add_glob_use("app::lib_rr", vec!["super".into()]);
-        scope.add_glob_use("app::lib_rr", vec!["dep".into()]);
+        scope.add_glob_use("app", vec!["self".into(), "lib_rr".into()], UseVis::Pub);
+        scope.add_glob_use("app::lib_rr", vec!["super".into()], UseVis::Pub);
+        scope.add_glob_use("app::lib_rr", vec!["dep".into()], UseVis::Pub);
         assert!(scope.lookup("value", "app", &["crate".into(), "lib_rr".into()], "app").is_some());
         assert!(scope.lookup("missing", "app", &["dep".into()], "app::lib_rr").is_none());
         assert!(scope.lookup("unreachable", "app", &["dep".into()], "app::lib_rr").is_none());
@@ -4636,7 +4759,7 @@ mod replay_tests {
             cm.mods.insert(module.clone());
             cm.items.insert(module.clone(), ModItem { vis, ..Default::default() });
             cm.add_use(UseItem { module, path: vec!["crate".into(), "value".into()], bind: Some("value".into()), vis: UseVis::Pub });
-            table.add_exp_uses("dep", [(("dep::facade".into(), format!("{leaf}_alias")), vec!["self".into(), "hidden".into(), leaf.into()])]);
+            table.add_exp_uses("dep", [(("dep::facade".into(), format!("{leaf}_alias")), vec![ExpUse { path: vec!["self".into(), "hidden".into(), leaf.into()], vis: UseVis::Pub }])]);
         }
         table.add_crate("dep".into(), std::sync::Arc::new(cm));
         table.push(definition("dep", "one"));
@@ -4645,6 +4768,66 @@ mod replay_tests {
         assert!(scope.lookup("value", "dep", &path("crate", "restricted_alias"), "dep").is_some(), "crate-visible leaf");
         assert!(scope.lookup("value", "app", &path("dep", "public_alias"), "app").is_some(), "public leaf behind a private prefix");
         assert!(scope.lookup("value", "app", &path("dep", "restricted_alias"), "app").is_none(), "crate-visible leaf from another crate");
+    }
+
+    #[test]
+    fn expansion_import_visibility_single_glob_and_seal() {
+        let mut table = macro_table();
+        let mut app = table.crates["app"].unresolved();
+        for module in ["priv_glob", "priv_glob::child", "caller", "crate_glob", "widen",
+            "shadow", "val_shadow", "single", "a", "a::limited"] {
+            app.mods.insert(format!("app::{module}"));
+        }
+        table.add_crate("app".into(), std::sync::Arc::new(app));
+        table.push(definition("dep", "one"));
+        let mut consumer = CrateMods { root: "consumer".into(), ..Default::default() };
+        consumer.externs.insert("app".into(), "app".into());
+        table.add_crate("consumer".into(), std::sync::Arc::new(consumer));
+        let base = std::sync::Arc::new(table);
+        let scope = MacroScope::new(base.clone());
+        for (module, vis) in [("app::priv_glob", UseVis::Private), ("app::crate_glob", UseVis::Crate),
+            ("app::widen", UseVis::Private), ("app::widen", UseVis::Pub),
+            ("app::a::limited", UseVis::In(vec!["crate".into(), "a".into()]))] {
+            scope.add_glob_use(module, vec!["dep".into()], vis);
+        }
+        for (module, path) in [("app::shadow", ["dep", "value"]), ("app::val_shadow", ["crate", "not_a_macro"])] {
+            scope.add_use(module, "value".into(), path.map(String::from).into(), UseVis::Private);
+            scope.add_glob_use(module, vec!["dep".into()], UseVis::Pub);
+        }
+        scope.add_use("app::single", "alias".into(), vec!["dep".into(), "value".into()], UseVis::Private);
+        let local_path = |name: &str| ["crate".into(), name.into()];
+        let private = local_path("priv_glob");
+        for (caller, visible) in [("app::priv_glob", true), ("app::priv_glob::child", true), ("app", false), ("app::caller", false)] {
+            assert_eq!(scope.lookup("value", "app", &private, caller).is_some(), visible, "private glob from {caller}");
+            assert_eq!(scope.import_binds("app", caller, &private, "value"), visible, "alias through private glob from {caller}");
+        }
+        for (owner, visible) in [("crate_glob", true), ("widen", true), ("shadow", false), ("val_shadow", true)] {
+            assert_eq!(scope.lookup("value", "app", &local_path(owner), "app::caller").is_some(), visible, "sibling lookup in {owner}");
+        }
+        for (caller, visible) in [("app::single", true), ("app::caller", false)] {
+            assert_eq!(scope.lookup("alias", "app", &local_path("single"), caller).is_some(), visible, "single import from {caller}");
+            assert_eq!(scope.import_binds("app", caller, &local_path("single"), "alias"), visible, "alias fallback from {caller}");
+        }
+        let limited = ["crate".into(), "a".into(), "limited".into()];
+        for (caller, visible) in [("app::a", true), ("app::caller", false)] {
+            assert_eq!(scope.lookup("value", "app", &limited, caller).is_some(), visible, "restricted glob from {caller}");
+        }
+
+        let used = scope.finish();
+        let bytes = used.replay_bytes().unwrap();
+        let mut table = (*base).clone();
+        table.add_exp_uses("app", used.uses.clone());
+        table.seal_crate("app");
+        let table = std::sync::Arc::new(table);
+        let replay = MacroUse::from_replay(used.local, used.uses, &bytes).unwrap();
+        assert!(replay.replays(&base, "app", "app.rs"));
+        assert!(replay.replays(&table, "app", "app.rs"));
+        let sealed = MacroScope::new(table);
+        for (owner, name, visible) in [("priv_glob", "value", false), ("crate_glob", "value", false),
+            ("widen", "value", true), ("single", "alias", false)] {
+            let path = ["app".into(), owner.into()];
+            assert_eq!(sealed.lookup(name, "consumer", &path, "consumer").is_some(), visible, "sealed {owner}::{name}");
+        }
     }
 
     #[test]

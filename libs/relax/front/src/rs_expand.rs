@@ -203,10 +203,13 @@ impl Parser<'_> {
                 out.extend_from_slice(&self.toks.range(start, stop));
             }
             if kind == T::KwUse {
+                self.pos = head;
+                let vis = self.vis()?;
                 self.pos = keyword + 1;
-                let global = self.eat(T::PathSep);
+                let global = self.eat(T::PathSep) || self.at_dollar_crate();
                 let tree = self.use_tree()?;
-                self.record_use(global, &tree);
+                let vis = self.use_vis(vis);
+                self.record_use(global, &tree, vis);
             }
             self.pos = stop;
             let mut linked = true;

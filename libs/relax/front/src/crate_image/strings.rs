@@ -204,6 +204,7 @@ impl Pack for crate::macros::UseVis {
         1 + match self { Self::In(path) => path.plain_size(), _ => 0 }
     }
 }
+fields!(crate::macros::ExpUse, path, vis);
 fields!(crate::macros::UseItem, module, path, bind, vis);
 fields!(crate::macros::ModItem, pos, end, macro_use, vis);
 
@@ -277,13 +278,19 @@ mod tests {
 
     #[test]
     fn packed_use_vis_roundtrips_all_variants() {
-        use crate::macros::UseVis;
+        use crate::macros::{ExpUse, UseVis};
         let values = vec![UseVis::Private, UseVis::Pub, UseVis::Crate, UseVis::Super,
             UseVis::In(vec!["crate".into(), "nested".into()])];
         let plain = crate::crate_image::encode(&values);
         assert_eq!(plain.len(), values.plain_size());
         assert_eq!(crate::crate_image::decode::<Vec<UseVis>>(&plain).unwrap(), values);
         assert_eq!(decode::<Vec<UseVis>>(&encode(&values)).unwrap(), values);
+
+        let exps: Vec<_> = values.into_iter().map(|vis| ExpUse { path: vec!["self".into(), "item".into()], vis }).collect();
+        let plain = crate::crate_image::encode(&exps);
+        assert_eq!(plain.len(), exps.plain_size());
+        assert_eq!(crate::crate_image::decode::<Vec<ExpUse>>(&plain).unwrap(), exps);
+        assert_eq!(decode::<Vec<ExpUse>>(&encode(&exps)).unwrap(), exps);
     }
 
     /// The table keeps first-use ids, finds repeats through growth, and reads back what it wrote.

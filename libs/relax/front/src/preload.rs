@@ -279,7 +279,7 @@ impl Pool {
     }
 
     /// The demand plan's outline of crate `ci`: its expansion-made imports (PendingPlan::outline_expansions).
-    pub(crate) fn outline_expansions(&self, ci: u32) -> Option<Arc<crate::fxhash::HashMap<(String, String), Vec<String>>>> {
+    pub(crate) fn outline_expansions(&self, ci: u32) -> Option<Arc<crate::fxhash::HashMap<(String, String), Vec<crate::macros::ExpUse>>>> {
         self.demand_plan.as_ref()?.outline_expansions(ci as usize + self.plan_offset)
     }
     /// Set queued jobs' scope; entering the crate replaces an early snapshot with the loader's.
