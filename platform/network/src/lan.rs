@@ -121,7 +121,8 @@ pub fn may_reach_host(host: &str) -> bool {
 /// Call it right before a connect or send to an address that may be a LAN host.
 pub fn check(site: &str, addr: SocketAddr) -> std::io::Result<()> {
     let ok = may_reach(addr.ip());
-    audit(site, &addr.to_string(), is_local_network(addr.ip()), ok);
+    // Some callers check every datagram: name the target only when the audit is on.
+    if crate::socket_audit::enabled() { audit(site, &addr.to_string(), is_local_network(addr.ip()), ok); }
     if ok {
         Ok(())
     } else {
