@@ -2290,7 +2290,7 @@ impl<'a> Fcx<'a> {
         let structural = peel_lit
             || matches!(ast.pat(p), Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct(..) | Pat::Slice(_))
             || matches!(ast.pat(p), Pat::Path(_) if !pre_const)
-            || matches!(ast.pat(p), Pat::Ident { sub, by_ref: false, mutbl: false, .. } if sub.is_none() && self.ident_pat_is_path(p) && !self.ident_pat_is_const(p));
+            || matches!(ast.pat(p), Pat::Ident { sub, by_ref: false, mutbl: false, .. } if sub.is_none() && self.ident_pat_is_unit_ctor(p));
         let mut expected = expected;
         let saved_mode = self.bind_mode;
         if structural {
@@ -2363,8 +2363,8 @@ impl<'a> Fcx<'a> {
             }
         };
         match ast.pat(p) {
-            Pat::Ident { name, sub, .. } => {
-                if !(sub.is_none() && self.ident_pat_is_path(p)) {
+            Pat::Ident { by_ref, mutbl, name, sub } => {
+                if !(sub.is_none() && !*by_ref && !*mutbl && self.ident_pat_is_path(p)) {
                     out.push((self.sym(*name), name.lo));
                 }
                 if let Some(sp) = &sub.get() {
@@ -2454,22 +2454,33 @@ impl<'a> Fcx<'a> {
         self.tcx.adts.get(&adt)?.variants.get(vi).map(|v| v.shape)
     }
 
-    fn ident_pat_is_const(&self, p: PatId) -> bool {
+    fn is_unit_ctor_def(&self, d: DefId) -> bool {
+        matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Variant)
+            && self.value_ctor_shape(d) == Some(0)
+    }
+
+    fn is_unit_or_const_pat_def(&self, d: DefId) -> bool {
+        matches!(self.prog.def(d).kind, DefKind::Const | DefKind::AssocConst)
+            || self.is_unit_ctor_def(d)
+    }
+
+    /// An identifier pattern naming a unit struct or unit variant (peels references under match ergonomics).
+    fn ident_pat_is_unit_ctor(&self, p: PatId) -> bool {
         if let Pat::Ident { name, .. } = self.ast().pat(p) {
             let s = self.sym(*name);
             if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
-                return matches!(self.prog.def(d).kind, DefKind::Const | DefKind::AssocConst);
+                return self.is_unit_ctor_def(d);
             }
         }
         false
     }
 
-    /// An identifier pattern naming a unit struct / unit variant / const (not a binding).
+    /// An identifier pattern naming a unit struct, unit variant, or constant (not a binding).
     fn ident_pat_is_path(&self, p: PatId) -> bool {
         if let Pat::Ident { name, .. } = self.ast().pat(p) {
             let s = self.sym(*name);
             if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
-                return matches!(self.prog.def(d).kind, DefKind::Const | DefKind::Variant | DefKind::Struct | DefKind::AssocConst);
+                return self.is_unit_or_const_pat_def(d);
             }
         }
         false
@@ -2497,7 +2508,7 @@ impl<'a> Fcx<'a> {
                         };
                         if let Some(what) = what {
                             self.err(name.lo, format!("E0530: bindings cannot shadow {what}"));
-                        } else if simple {
+                        } else if simple && self.is_unit_or_const_pat_def(d) {
                             // an identifier pattern naming something ambiguous is an error, not a fresh binding
                             if let Some(e) = self.prog.name_ambiguity(self.module, s, false, false) {
                                 if let Some(m) = crate::lint::privacy_diag(self.prog, self.file, name.lo, &e) { self.err(name.lo, m); }
@@ -2508,8 +2519,7 @@ impl<'a> Fcx<'a> {
                 // a unit struct / unit variant / const in scope is a path pattern, not a binding
                 if sub.is_none() && !*by_ref && !*mutbl {
                     if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
-                        let k = self.prog.def(d).kind;
-                        if matches!(k, DefKind::Const | DefKind::Variant | DefKind::Struct | DefKind::AssocConst) {
+                        if self.is_unit_or_const_pat_def(d) {
                             self.b.pat_res.insert(p.0, Res::Def(d));
                             let t = self.value_def_ty(d, None, p.0 | PAT_KEY);
                             self.coerce_or_unify(t, expected, None, name.lo);
@@ -2527,7 +2537,7 @@ impl<'a> Fcx<'a> {
                             DefKind::Static | DefKind::ForeignStatic => Some("statics"),
                             // (reached only with `mut`, `ref` or `@`: otherwise the name is a path)
                             DefKind::Const | DefKind::AssocConst => Some("constants"),
-                            DefKind::Variant | DefKind::Struct => Some("unit variants or structs"),
+                            DefKind::Variant | DefKind::Struct if self.is_unit_ctor_def(d) => Some("unit variants or structs"),
                             _ => None,
                         };
                         if let Some(what) = what {

@@ -53,6 +53,54 @@ fn has(errors: &[String], item: &str, code: &str) -> bool {
     errors.iter().any(|e| e.split_once(": ").is_some_and(|(path, rest)| (path == item || path.ends_with(&format!("::{item}"))) && rest.starts_with(code)))
 }
 
+#[test]
+fn bare_struct_variant_ident_is_binding_not_path_pattern() {
+    let e = errors("
+        pub enum Role { Host, Viewer { sharer: u32 }, EmptyStruct {} }
+        pub fn single(r: Role) -> Role {
+            use Role::Viewer;
+            let Viewer = Role::Host;
+            let _: Role = Viewer;
+            match r { Viewer => Viewer }
+        }
+        pub fn glob(r: &Role) {
+            use Role::*;
+            match r { Viewer => { let _: &Role = Viewer; } }
+            match r { EmptyStruct => { let _: &Role = EmptyStruct; } }
+        }
+        pub fn modes(r: Role) -> Role {
+            use Role::Viewer;
+            match r { ref Viewer => { let _: &Role = Viewer; } }
+            match r { mut Viewer => { Viewer = Role::Host; match Viewer { Viewer @ _ => Viewer } } }
+        }
+        mod a { pub enum A { Same { x: u32 }, Other } }
+        mod b { pub enum B { Same { y: u32 } } }
+        pub fn ambiguous() {
+            use a::A::*;
+            use b::B::*;
+            match a::A::Other { Same => { let _: a::A = Same; } }
+        }");
+    assert!(e.is_empty(), "legal struct variant bindings: {e:?}");
+
+    let e = errors("
+        pub enum Role { Host, Viewer { sharer: u32 } }
+        use Role::{Host, Viewer};
+        pub fn dup(a: Role, b: Role) { match (a, b) { (Viewer, Viewer) => {} } }
+        pub fn or_miss(r: Role) { match r { Viewer | _ => {} } }
+        pub fn or_mode(r: Role) { match r { mut Viewer | Viewer => {} } }
+        pub fn dup_param(Viewer: Role, Viewer: Role) {}
+        pub fn dup_mut_host_param(mut Host: Role, mut Host: Role) {}
+        pub fn unit_ok(a: Role, b: Role) {
+            match a { Host | _ => {} }
+            match (a, b) { (Host, Host) => {}, _ => {} }
+        }");
+    for (f, code) in [("dup", "E0416"), ("or_miss", "E0408"), ("or_mode", "E0409"),
+                      ("dup_param", "E0415"), ("dup_mut_host_param", "E0415")] {
+        assert!(e.iter().any(|x| x.starts_with(&format!("repro::{f}: ")) && x.contains(&format!(": {code}: "))), "{f}: expected {code}, got {e:?}");
+    }
+    assert!(!e.iter().any(|x| x.starts_with("repro::unit_ok: ")), "unit variant paths: {e:?}");
+}
+
 /// `let _ = *r;` mentions the place behind `r` without using its value. Going through the `Deref` reads the
 /// pointer `r`, so with `r` never initialized it is E0381, as an assignment through it would give. A mention
 /// without a `Deref` reads nothing and stays accepted.
