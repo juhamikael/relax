@@ -29,28 +29,26 @@ pub fn no_codegen() -> bool {
 /// The process's executable memory that no loaded image backs (macOS): (start, size, prot) per
 /// region. No-codegen mode checks it is empty when the process ends -- generated code anywhere
 /// in the process (the JIT, a kernel compiler, a library) shows up here.
-/// `VM_REGION_BASIC_INFO_64`'s buffer, as `mach_vm_region` fills it. Shared by every declaration of
-/// `mach_vm_region` in this crate, so they keep one signature.
-#[cfg(target_vendor = "apple")]
-#[repr(C)]
-#[derive(Default)]
-pub(crate) struct BasicInfo64 {
-    protection: i32,
-    max_protection: i32,
-    inheritance: u32,
-    shared: u32,
-    reserved: u32,
-    offset: u64,
-    behavior: i32,
-    user_wired_count: u16,
-}
-
 #[cfg(target_vendor = "apple")]
 pub fn anonymous_exec_regions() -> Vec<(u64, u64, i32)> {
+    // `vm_region_basic_info_64` as the SDK declares it, under `#pragma pack(4)`: 36 bytes, so
+    // `count` is exactly `VM_REGION_BASIC_INFO_COUNT_64` (9).
+    #[repr(C, packed(4))]
+    #[derive(Default)]
+    struct BasicInfo64 {
+        protection: i32,
+        max_protection: i32,
+        inheritance: u32,
+        shared: u32,
+        reserved: u32,
+        offset: u64,
+        behavior: i32,
+        user_wired_count: u16,
+    }
     use super::proc::{dladdr, DlInfo};
     extern "C" {
         fn mach_task_self() -> u32;
-        fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut BasicInfo64, count: *mut u32, object: *mut u32) -> i32;
+        fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut i32, count: *mut u32, object: *mut u32) -> i32;
     }
     const VM_REGION_BASIC_INFO_64: i32 = 9;
     const VM_PROT_EXECUTE: i32 = 4;
@@ -62,7 +60,7 @@ pub fn anonymous_exec_regions() -> Vec<(u64, u64, i32)> {
             let mut info = BasicInfo64::default();
             let mut count = (std::mem::size_of::<BasicInfo64>() / 4) as u32;
             let mut object = 0u32;
-            if mach_vm_region(mach_task_self(), &mut addr, &mut size, VM_REGION_BASIC_INFO_64, &mut info, &mut count, &mut object) != 0 {
+            if mach_vm_region(mach_task_self(), &mut addr, &mut size, VM_REGION_BASIC_INFO_64, (&mut info as *mut BasicInfo64).cast::<i32>(), &mut count, &mut object) != 0 {
                 break;
             }
             if info.protection & VM_PROT_EXECUTE != 0 {

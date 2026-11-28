@@ -1906,12 +1906,11 @@ fn unmapped(addr: usize) -> bool {
     unsafe {
         extern "C" {
             static mach_task_self_: u32;
-            fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut crate::os::mem::BasicInfo64, count: *mut u32, object: *mut u32) -> i32;
+            fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut i32, count: *mut u32, object: *mut u32) -> i32;
             fn mach_port_deallocate(task: u32, name: u32) -> i32;
         }
-        let mut info = crate::os::mem::BasicInfo64::default();
-        let (mut q, mut size, mut count, mut object) = (addr as u64, 0, 9, 0);
-        let result = mach_vm_region(mach_task_self_, &mut q, &mut size, 9, &mut info, &mut count, &mut object);
+        let (mut q, mut size, mut info, mut count, mut object) = (addr as u64, 0, [0i32; 16], 9, 0);
+        let result = mach_vm_region(mach_task_self_, &mut q, &mut size, 9, info.as_mut_ptr(), &mut count, &mut object);
         if object != 0 { mach_port_deallocate(mach_task_self_, object); }
         result != 0 || q > addr as u64
     }
