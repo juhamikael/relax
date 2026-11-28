@@ -3253,10 +3253,13 @@ impl<'a> ImportLookup<'a> {
 
     fn lookup(&mut self, name: Name, k: Name, path: &[Name], module: Name) -> Option<MacroRef> {
         let origin = k;
-        let result = loop {
-            if let Some((tk, tm)) = self.path(k, module, path, None) {
-                if let Some(ImportValue::Macro(d)) = self.ask(ImportNs::Macro, tk, tm, name, (origin == tk).then_some(module), None) {
-                    if self.ready.is_empty() { break Some(d); }
+        let mut result = None;
+        loop {
+            if result.is_none() {
+                if let Some((tk, tm)) = self.path(k, module, path, None) {
+                    if let Some(ImportValue::Macro(d)) = self.ask(ImportNs::Macro, tk, tm, name, (origin == tk).then_some(module), None) {
+                        result = Some(d);
+                    }
                 }
             }
             if !self.ready.is_empty() {
@@ -3264,26 +3267,29 @@ impl<'a> ImportLookup<'a> {
                 continue;
             }
             if !self.unlock_externs() {
-                break None;
+                break;
             }
-        };
+        }
         self.finish_states();
         result
     }
 
     fn resolve_mod(&mut self, k: Name, module: Name, path: &[Name]) -> Option<(Name, Name)> {
-        let result = loop {
-            if let Some(at) = self.path(k, module, path, None) {
-                if self.ready.is_empty() { break Some(at); }
+        let mut result = None;
+        loop {
+            if result.is_none() {
+                if let Some(at) = self.path(k, module, path, None) {
+                    result = Some(at);
+                }
             }
             if !self.ready.is_empty() {
                 self.drain_ready();
                 continue;
             }
             if !self.unlock_externs() {
-                break None;
+                break;
             }
-        };
+        }
         self.finish_states();
         result
     }
@@ -5563,6 +5569,58 @@ mod replay_tests {
         scope.add_glob_use("app", vec!["dep".into()], UseVis::Private);
         scope.add_glob_use("app", vec!["alias".into()], UseVis::Private);
         assert_eq!(scope.lookup("value", "app", &[], "app").unwrap().krate, "app", "the later glob provides the local dep");
+
+        // A lookup answered through a sibling glob while another import still waits on its
+        // extern fallback must not publish that waiting import as absent.
+        let mut waiting = table.clone();
+        let mut bar = (*definition("dep", "target")).clone();
+        bar.name = "bar".into();
+        waiting.define(bar);
+        let dep = waiting.crates["dep"].unresolved();
+        waiting.add_crate("dep".into(), std::sync::Arc::new(dep));
+        waiting.add_exp_uses("dep", [entry("second", &["first", "sub"])]);
+        let waiting = std::sync::Arc::new(waiting);
+        let scope = MacroScope::new(waiting.clone());
+        scope.add_glob_use("app", vec!["dep".into(), "facade".into(), "second".into()], UseVis::Private);
+        scope.add_glob_use("app", vec!["dep".into()], UseVis::Private);
+        assert_eq!(scope.lookup("bar", "app", &[], "app").map(|d| d.krate.clone()).as_deref(), Some("dep"), "the sibling glob provides bar");
+        assert_eq!(from_app(&scope, "second").as_deref(), Some("first"), "second still resolves in the same scope after that lookup");
+        assert_eq!(from_app(&MacroScope::new(waiting), "second").as_deref(), Some("first"), "the shared import snapshot holds no unsettled second");
+
+        // Same early-exit hazard in `ImportLookup::resolve_mod` (via `reaches_builtin`).
+        let mut mod_wait = table.clone();
+        let mut dep = mod_wait.crates["dep"].unresolved();
+        dep.externs.insert("core".into(), "core".into());
+        dep.add_use(UseItem { module: "dep".into(), path: vec!["core".into()],
+            bind: Some("target".into()), vis: UseVis::Pub });
+        mod_wait.add_crate("dep".into(), std::sync::Arc::new(dep));
+        mod_wait.add_exp_uses("dep", [entry("second", &["first", "sub"])]);
+        let mod_wait = std::sync::Arc::new(mod_wait);
+        let scope = MacroScope::new(mod_wait.clone());
+        scope.add_glob_use("app", vec!["dep".into(), "facade".into(), "second".into()], UseVis::Private);
+        scope.add_glob_use("app", vec!["dep".into()], UseVis::Private);
+        let target_builtin = ["target".into(), "stringify".into()];
+        assert!(scope.reaches_builtin("app", "app", &target_builtin), "the sibling glob provides target");
+        assert_eq!(from_app(&scope, "second").as_deref(), Some("first"), "second still resolves in the same scope after resolve_mod");
+        assert_eq!(from_app(&MacroScope::new(mod_wait), "second").as_deref(), Some("first"), "the shared import snapshot holds no unsettled second after resolve_mod");
+
+        // Same early-exit hazard for `self_extern_wait` (`pub use first;` with an in-scope glob).
+        let mut self_wait = table.clone();
+        let mut bar = (*definition("dep", "target")).clone();
+        bar.name = "bar".into();
+        self_wait.define(bar);
+        let mut dep = self_wait.crates["dep"].unresolved();
+        dep.mods.insert("dep::facade::empty".into());
+        dep.items.insert("dep::facade::empty".into(), ModItem { vis: UseVis::Pub, ..Default::default() });
+        self_wait.add_crate("dep".into(), std::sync::Arc::new(dep));
+        self_wait.add_exp_uses("dep", [entry("first", &["first"]), entry(GLOB, &["self", "empty"])]);
+        let self_wait = std::sync::Arc::new(self_wait);
+        let scope = MacroScope::new(self_wait.clone());
+        scope.add_glob_use("app", vec!["dep".into(), "facade".into(), "first".into()], UseVis::Private);
+        scope.add_glob_use("app", vec!["dep".into()], UseVis::Private);
+        assert_eq!(scope.lookup("bar", "app", &[], "app").map(|d| d.krate.clone()).as_deref(), Some("dep"), "the sibling glob provides bar");
+        assert_eq!(from_app(&scope, "first").as_deref(), Some("first"), "self-bare first still resolves in the same scope");
+        assert_eq!(from_app(&MacroScope::new(self_wait), "first").as_deref(), Some("first"), "the shared import snapshot holds no unsettled self-bare first");
 
         let table = std::sync::Arc::new(table);
         let scope = MacroScope::new(table.clone());
