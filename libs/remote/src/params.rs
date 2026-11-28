@@ -258,7 +258,11 @@ pub const DESIGN: &[(&str, &str)] = &[
     ("patch", r#""#),
     ("commit", r#""#),
     ("bake", r#""if_user_seq":{"type":"integer"}"#),
-    ("verify", r#""#),
+    ("preview", r#""file":{"type":"string"},"base_hash":{"type":"string"},"edits":{"type":"string"},"text":{"type":"string"},"upload":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("preview_chunk", r#""file":{"type":"string"},"id":{"type":"string"},"seq":{"type":"integer"},"data":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("revert", r#""file":{"type":"string"},"if_user_seq":{"type":"integer"}"#),
+    ("verify", r#""file":{"type":"string"},"path":{"type":"string"},"w":{"type":"integer"},"window":{"type":"integer"}"#),
+    ("drop", r#""w":{"type":"integer"},"window":{"type":"integer"},"at":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"exclude":{"type":"string"}"#),
 ];
 
 pub fn design(words: &str) -> Option<&'static str> {
