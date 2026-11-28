@@ -1900,6 +1900,608 @@ fn host_op_callback_sink_safe_across_all_classes_and_memstat() {
     }
 }
 
+#[cfg(unix)]
+fn unmapped(addr: usize) -> bool {
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut i32, count: *mut u32, object: *mut u32) -> i32;
+            fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        }
+        let (mut q, mut size, mut info, mut count, mut object) = (addr as u64, 0, [0i32; 16], 9, 0);
+        let result = mach_vm_region(mach_task_self_, &mut q, &mut size, 9, info.as_mut_ptr(), &mut count, &mut object);
+        if object != 0 { mach_port_deallocate(mach_task_self_, object); }
+        result != 0 || q > addr as u64
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        extern "C" { fn mincore(addr: *mut std::ffi::c_void, len: usize, vec: *mut u8) -> i32; }
+        let mut resident = 0;
+        mincore(addr as *mut _, 1, &mut resident) == -1 && std::io::Error::last_os_error().raw_os_error() == Some(12)
+    }
+}
+
+// Each accounting mode needs its own process, including a fresh native teardown callback.
+#[cfg(unix)]
+fn mapping_pa_child(name: &str) -> bool {
+    const CHILD: &str = "RELAX_TEST_MAPPING_PA_REPORT";
+    if let Ok(report) = std::env::var(CHILD) {
+        assert_eq!(crate::memstat::enabled(), report == "1");
+        return true;
+    }
+    let test = format!("domain::teardown_tests::{name}");
+    for report in ["0", "1"] {
+        let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"]).env(CHILD, report).env("RELAX_MEM_REPORT", report));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{name} with accounting={report}: {stdout}{stderr}");
+        assert!(!stderr.contains("-byte probe, outside the memory its domain owns"), "mapping PA probe: {stderr}");
+    }
+    false
+}
+
+// Source compiled by the fixture JIT. The counters live in the child host across domain teardown.
+#[cfg(unix)]
+const MAPPING_PA_SOURCE: &str = r#"
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+}
+const MIB: usize = 1 << 20;
+const PAGE: usize = OS_PAGE;
+fn layout(size: usize) -> Layout { Layout::from_size_align(size, 8).unwrap() }
+fn counters() -> &'static [AtomicUsize; 3] { unsafe { &*(COUNTERSusize as *const [AtomicUsize; 3]) } }
+fn mapped(l: Layout) -> bool { l.size() >= 4 * MIB && l.align() <= 4096 }
+unsafe fn map_pages(len: usize) -> *mut u8 {
+    let p = mmap(std::ptr::null_mut(), len, 3, 2 | ANON_FLAG, ANON_FD, 0);
+    if p as isize == -1 { return std::ptr::null_mut(); }
+    counters()[0].fetch_add(1, Ordering::Relaxed);
+    p
+}
+struct MmapLargeAllocator;
+#[global_allocator]
+static ALLOCATOR: MmapLargeAllocator = MmapLargeAllocator;
+unsafe impl GlobalAlloc for MmapLargeAllocator {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        if mapped(l) { map_pages(l.size()) } else { System.alloc(l) }
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        if mapped(l) { map_pages(l.size()) } else { System.alloc_zeroed(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        if mapped(l) {
+            assert_eq!(munmap(p, l.size()), 0);
+            counters()[1].fetch_add(1, Ordering::Relaxed);
+        } else { System.dealloc(p, l); }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+        let new = Layout::from_size_align_unchecked(size, l.align());
+        if !mapped(l) && !mapped(new) { return System.realloc(p, l, size); }
+        if mapped(l) && mapped(new) {
+            let have = (l.size() + PAGE - 1) & !(PAGE - 1);
+            let want = (size + PAGE - 1) & !(PAGE - 1);
+            if want <= have {
+                if want < have {
+                    assert_eq!(munmap(p.add(want), have - want), 0);
+                    counters()[2].fetch_add(1, Ordering::Relaxed);
+                }
+                return p;
+            }
+            GROW_MAPPING
+        }
+        let q = self.alloc(new);
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, l.size().min(size));
+            self.dealloc(p, l);
+        }
+        q
+    }
+}
+"#;
+
+#[cfg(unix)]
+fn mapping_source(body: &str, counts: &[std::sync::atomic::AtomicUsize; 3]) -> String {
+    mapping_source_with_growth(body, counts, "")
+}
+
+#[cfg(unix)]
+fn mapping_source_with_growth(body: &str, counts: &[std::sync::atomic::AtomicUsize; 3], growth: &str) -> String {
+    let (anon, fd) = if cfg!(target_vendor = "apple") { ("0x1000", "(240u32 << 24) as i32") } else { ("0x20", "-1") };
+    (MAPPING_PA_SOURCE.to_owned() + body).replace("OS_PAGE", &crate::os::mem::page_size().to_string())
+        .replace("COUNTERS", &(counts.as_ptr() as usize).to_string()).replace("ANON_FLAG", anon).replace("ANON_FD", fd)
+        .replace("GROW_MAPPING", growth)
+}
+
+#[cfg(unix)]
+fn pa_fixture(source: &str) -> (Box<Unit>, u64, std::path::PathBuf) {
+    let (mut u, entry, root) = fixture_of(source, "fixture");
+    let krate = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "fixture").unwrap().krate;
+    crate::layout::set_root_crate(krate);
+    u.tier1 = None;
+    (u, entry, root)
+}
+
+// Called by the fixture thread, or by its host while that thread is parked.
+#[cfg(unix)]
+fn with_mapping_heap<R>(base: u64, check: impl FnOnce(&crate::zone_alloc::domain::DomainHeap) -> R) -> R {
+    let _kept = crate::zone_alloc::kept();
+    let ds = domains();
+    check(ds.iter().find(|d| d.info.base == base).unwrap().heap.as_deref().unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn run_op_large_block_freed_and_resized_by_mapping_pa() {
+    if !mapping_pa_child("run_op_large_block_freed_and_resized_by_mapping_pa") { return; }
+    use crate::memstat::Counting;
+    use std::alloc::{GlobalAlloc, Layout};
+    extern "C" fn allocate(size: usize, zero: bool) -> *mut u8 {
+        let _run = relax_session::phase::run();
+        let l = Layout::from_size_align(size, 8).unwrap();
+        unsafe { if zero { Counting.alloc_zeroed(l) } else { Counting.alloc(l) } }
+    }
+    extern "C" fn grow(p: *mut u8, old: usize, new: usize) -> *mut u8 {
+        let _run = relax_session::phase::run();
+        unsafe { Counting.realloc(p, Layout::from_size_align(old, 8).unwrap(), new) }
+    }
+    extern "C" fn check_heap() {
+        with_mapping_heap(current(), |heap| {
+            assert_eq!(heap.stats().0, 0, "all domain arena blocks were returned");
+            assert!(heap.mapped_ranges().is_empty(), "all PA maps were returned");
+            assert!(!unmapped(heap.range().0), "the domain arena base is still mapped");
+        });
+    }
+    let counts = Default::default();
+    let source = mapping_source(r#"
+        fn fixture(args: *const usize) { unsafe {
+            let alloc: extern "C" fn(usize, bool) -> *mut u8 = std::mem::transmute(*args);
+            let grow: extern "C" fn(*mut u8, usize, usize) -> *mut u8 = std::mem::transmute(*args.add(1));
+            let check: extern "C" fn() = std::mem::transmute(*args.add(2));
+            let four = layout(4 * MIB);
+            let p = alloc(four.size(), false);
+            assert!(!p.is_null());
+            std::alloc::dealloc(p, four);
+            let p = alloc(8 * MIB, true);
+            assert!(!p.is_null() && p.read() == 0 && p.add(8 * MIB - 1).read() == 0);
+            p.write(11);
+            let q = std::alloc::realloc(p, layout(8 * MIB), four.size());
+            assert_eq!(q, p);
+            let r = std::alloc::realloc(q, four, MIB);
+            assert!(!r.is_null() && r.read() == 11);
+            std::alloc::dealloc(r, layout(MIB));
+            let p = alloc(four.size(), false);
+            assert!(!p.is_null());
+            p.write(27);
+            let q = std::alloc::realloc(p, four, 6 * MIB);
+            assert!(!q.is_null() && q.read() == 27);
+            std::alloc::dealloc(q, layout(6 * MIB));
+            let p = std::alloc::alloc(layout(MIB));
+            assert!(!p.is_null());
+            p.write(39);
+            let q = grow(p, MIB, 5 * MIB);
+            assert!(!q.is_null() && q.read() == 39);
+            std::alloc::dealloc(q, layout(5 * MIB));
+            check();
+        } }
+    "#, &counts);
+    let (mut u, entry, root) = pa_fixture(&source);
+    let args = [allocate as *const () as usize, grow as *const () as usize, check_heap as *const () as usize];
+    let (id, _, main) = try_launch_with(&mut u, entry, None, args.as_ptr() as u64, true).unwrap();
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(state(id), Some(DomainState::Exited(0)));
+    let [maps, unmaps, tails] = counts.map(|v| v.into_inner());
+    assert!(maps >= 4 && maps == unmaps, "{maps} successful maps, {unmaps} complete releases");
+    assert!(tails >= 1, "shrinking a mapped block returned its tail");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn jit_frees_a_large_counted_loader_buffer_with_mapping_pa() {
+    if !mapping_pa_child("jit_frees_a_large_counted_loader_buffer_with_mapping_pa") { return; }
+    use std::alloc::{GlobalAlloc, Layout};
+    extern "C" fn buffer(before: *mut i64) -> *mut u8 {
+        let _kept = crate::zone_alloc::kept();
+        unsafe {
+            *before = crate::memstat::live_total();
+            crate::memstat::Counting.alloc(Layout::from_size_align(4 << 20, 8).unwrap())
+        }
+    }
+    extern "C" fn live() -> i64 { crate::memstat::live_total() }
+    let counts = Default::default();
+    let source = mapping_source(r#"
+        fn fixture(args: *const usize) { unsafe {
+            let buffer: extern "C" fn(*mut i64) -> *mut u8 = std::mem::transmute(*args);
+            let live: extern "C" fn() -> i64 = std::mem::transmute(*args.add(1));
+            let unmaps = counters()[1].load(Ordering::Relaxed);
+            assert!(unmaps >= 1);
+            for pass in 0..2 {
+                let mut before = 0i64;
+                let p = buffer(&mut before);
+                assert!(!p.is_null());
+                std::alloc::dealloc(p, layout(4 * MIB));
+                let after = live();
+                if pass == 1 { assert_eq!(after, before); }
+            }
+            assert_eq!(counters()[1].load(Ordering::Relaxed), unmaps);
+        } }
+    "#, &counts);
+    let (mut u, entry, root) = pa_fixture(&source);
+    let args = [buffer as *const () as usize, live as *const () as usize];
+    let (id, _, main) = try_launch_with(&mut u, entry, None, args.as_ptr() as u64, true).unwrap();
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(state(id), Some(DomainState::Exited(0)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// The host waits for a fixture milestone or its early exit; a broken handshake must terminate the child.
+#[cfg(unix)]
+fn wait_mapping_stage(stage: &std::sync::atomic::AtomicUsize, expected: usize, main: &std::thread::JoinHandle<()>, id: DomainId) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while stage.load(Ordering::Acquire) != expected {
+        assert!(!main.is_finished() && std::time::Instant::now() < deadline,
+            "domain {id} did not reach stage {expected} (at {}, state {:?})", stage.load(Ordering::Acquire), state(id));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn loader_drops_and_resizes_mapping_pa_large_block() {
+    if !mapping_pa_child("loader_drops_and_resizes_mapping_pa_large_block") { return; }
+    use crate::memstat::Counting;
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicUsize;
+    const MIB: usize = 1 << 20;
+    static COUNTS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+    static LEAKED: AtomicUsize = AtomicUsize::new(0);
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn release(p: *mut u8, len: usize, align: usize) {
+        let _run = relax_session::phase::run();
+        unsafe { Counting.dealloc(p, Layout::from_size_align(len, align).unwrap()) };
+    }
+    extern "C" fn resize(p: *mut u8, len: usize, new: usize) -> *mut u8 {
+        let _run = relax_session::phase::run();
+        unsafe { Counting.realloc(p, Layout::from_size_align(len, 8).unwrap(), new) }
+    }
+    extern "C" fn check_arena(p: usize, len: usize) {
+        with_mapping_heap(current(), |heap| {
+            assert!(heap.ranges().any(|(a, n)| a <= p && p + len <= a + n), "over-aligned block belongs to the arena");
+        });
+    }
+    fn heap_goes(base: usize, end: usize) {
+        let p = LEAKED.load(Ordering::Acquire);
+        if p == 0 || !(base..end).contains(&p) { return; }
+        assert_eq!((base, end - base), (p, 4 * MIB));
+        let before = COUNTS[1].load(Ordering::Acquire);
+        unsafe { Counting.dealloc(p as *mut u8, Layout::from_size_align(4 * MIB, 8).unwrap()) };
+        assert_eq!(COUNTS[1].load(Ordering::Acquire), before, "code end kept the PA out of the native drop");
+        assert!(!unmapped(p), "the heap still holds the mapping during its callback");
+        SEEN.fetch_add(1, Ordering::Release);
+    }
+    crate::run_end::set_native_end(|| {}, heap_goes);
+    let source = mapping_source(r#"
+        #[inline(never)]
+        fn patch_value() -> usize { 13 }
+        fn fixture(args: *const usize) { unsafe {
+            let release: extern "C" fn(*mut u8, usize, usize) = std::mem::transmute(*args);
+            let resize: extern "C" fn(*mut u8, usize, usize) -> *mut u8 = std::mem::transmute(*args.add(1));
+            let check_arena: extern "C" fn(usize, usize) = std::mem::transmute(*args.add(2));
+            let gate = &*(*args.add(3) as *const [AtomicUsize; 3]);
+            let four = layout(4 * MIB);
+            for pass in 0..2usize {
+                let p = std::alloc::alloc(four);
+                assert!(!p.is_null());
+                release(p, four.size(), 8);
+                let p = std::alloc::alloc_zeroed(four);
+                assert!(!p.is_null() && p.add(four.size() - 1).read() == 0);
+                release(p, four.size(), 8);
+
+                let p = std::alloc::alloc(four);
+                assert!(!p.is_null());
+                p.write(61);
+                p.add(four.size() - 1).write(62);
+                let q = resize(p, four.size(), 8 * MIB);
+                assert!(!q.is_null() && q.read() == 61 && q.add(four.size() - 1).read() == 62);
+                let r = resize(q, 8 * MIB, MIB);
+                assert!(!r.is_null() && r.read() == 61);
+                release(r, MIB, 8);
+
+                let p = std::alloc::alloc(four);
+                assert!(!p.is_null());
+                p.write(71);
+                gate[2].store(p as usize, Ordering::Relaxed);
+                let foreign = 2 * pass + 1;
+                gate[0].store(foreign, Ordering::Release);
+                while gate[1].load(Ordering::Acquire) != foreign { std::thread::yield_now(); }
+                let aligned = Layout::from_size_align(four.size(), 64 << 10).unwrap();
+                let p = std::alloc::alloc(aligned);
+                assert!(!p.is_null() && p as usize % aligned.align() == 0);
+                check_arena(p as usize, four.size());
+                release(p, four.size(), aligned.align());
+                gate[0].store(foreign + 1, Ordering::Release);
+                while gate[1].load(Ordering::Acquire) != foreign + 1 { std::thread::yield_now(); }
+            }
+            assert_eq!(patch_value(), 13);
+            let p = std::alloc::alloc(four);
+            assert!(!p.is_null());
+            gate[2].store(p as usize, Ordering::Relaxed);
+            gate[0].store(5, Ordering::Release);
+            while gate[1].load(Ordering::Acquire) != 5 { std::thread::yield_now(); }
+            assert_eq!(patch_value(), 17);
+            let leaked = std::alloc::alloc(four);
+            assert!(!leaked.is_null());
+            gate[2].store(leaked as usize, Ordering::Relaxed);
+            gate[0].store(6, Ordering::Release);
+            loop { std::thread::yield_now(); }
+        } }
+    "#, &COUNTS);
+    let (mut u, entry, root) = pa_fixture(&source);
+    let def = u.prog.defs.iter().find(|d| u.prog.syms.str(d.name) == "patch_value").unwrap();
+    let file = def.file;
+    let gate: [AtomicUsize; 3] = Default::default();
+    let args = [release as *const () as usize, resize as *const () as usize, check_arena as *const () as usize, gate.as_ptr() as usize];
+    let (id, base, main) = try_launch_with(&mut u, entry, None, args.as_ptr() as u64, true).unwrap();
+    let mut baseline = 0;
+    for foreign in [1, 3] {
+        wait_mapping_stage(&gate[0], foreign, &main, id);
+        let p = gate[2].load(Ordering::Relaxed) as *mut u8;
+        unsafe {
+            let q = Counting.realloc(p, Layout::from_size_align(4 * MIB, 8).unwrap(), 5 * MIB);
+            assert!(!q.is_null() && q.read() == 71, "foreign resize retained the payload");
+            Counting.dealloc(q, Layout::from_size_align(5 * MIB, 8).unwrap());
+        }
+        gate[1].store(foreign, Ordering::Release);
+        wait_mapping_stage(&gate[0], foreign + 1, &main, id);
+        with_mapping_heap(base, |heap| {
+            assert_eq!(heap.stats().0, 0);
+            assert!(heap.mapped_ranges().is_empty());
+        });
+        let live = crate::memstat::live_total();
+        if foreign == 1 { baseline = live; } else { assert_eq!(live, baseline, "warmed crossings returned all counted bytes"); }
+        gate[1].store(foreign + 1, Ordering::Release);
+    }
+    wait_mapping_stage(&gate[0], 5, &main, id);
+    let p = gate[2].load(Ordering::Relaxed);
+    with_mapping_heap(base, |heap| assert_eq!(heap.mapped_ranges(), [(p, 4 * MIB)]));
+    let edit = crate::reload::Edit {
+        file, path: root.join("fixture.rs").to_string_lossy().into_owned(),
+        src: source.replace("fn patch_value() -> usize { 13 }", "fn patch_value() -> usize { 17 }").into_bytes(),
+    };
+    let patch = unsafe { crate::reload::apply(&mut *u, vec![edit]) };
+    assert_eq!(patch.rung, crate::reload::Rung::Patch, "{:?}", patch.lines);
+    unsafe { Counting.dealloc(p as *mut u8, Layout::from_size_align(4 * MIB, 8).unwrap()) };
+    assert_eq!(COUNTS[0].load(Ordering::Acquire), COUNTS[1].load(Ordering::Acquire), "all non-leaked maps were freed");
+    gate[1].store(5, Ordering::Release);
+    wait_mapping_stage(&gate[0], 6, &main, id);
+    let leaked = gate[2].load(Ordering::Relaxed);
+    LEAKED.store(leaked, Ordering::Release);
+    with_mapping_heap(base, |heap| assert_eq!(heap.mapped_ranges(), [(leaked, 4 * MIB)]));
+    let end = end_run(&mut *u, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "fixture thread still running after end_run: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(end.released.mappings, 0, "the resource table has no claim on the PA's mapping");
+    assert_eq!(SEEN.load(Ordering::Acquire), 1);
+    assert!(unmapped(leaked), "dropping the heap released the surviving mapping");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_mremap_pa_tracks_moved_mapping_without_staleness() {
+    if !mapping_pa_child("linux_mremap_pa_tracks_moved_mapping_without_staleness") { return; }
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicUsize;
+    const FOUR: usize = 4 << 20;
+    extern "C" fn barrier(old: usize) -> bool {
+        extern "C" { fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8; }
+        const MAP_FIXED_NOREPLACE: i32 = 0x100000;
+        let at = (old + FOUR) as *mut u8;
+        let p = unsafe { mmap(at, crate::os::mem::page_size() as usize, 0, 2 | 0x20 | MAP_FIXED_NOREPLACE, -1, 0) };
+        if p as isize == -1 {
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(17), "the adjacent page must already be occupied");
+            return false;
+        }
+        assert_eq!(p, at, "the barrier must block in-place growth");
+        true
+    }
+    extern "C" fn restored(old: usize) {
+        with_mapping_heap(current(), |heap| {
+            assert!(unsafe { crate::zone_alloc::domain::heap_owns(heap.as_ptr(), old as *mut u8) });
+            assert_eq!(heap.mapped_ranges(), [(old, FOUR)], "failed mremap restored the entire original map");
+        });
+    }
+    extern "C" fn moved(old: usize, new: usize, placed: bool) {
+        extern "C" { fn munmap(addr: *mut u8, len: usize) -> i32; }
+        if placed { assert_eq!(unsafe { munmap((old + FOUR) as *mut u8, crate::os::mem::page_size() as usize) }, 0); }
+        with_mapping_heap(current(), |heap| {
+            let owns = |p| unsafe { crate::zone_alloc::domain::heap_owns(heap.as_ptr(), p as *mut u8) };
+            assert!(!owns(old) && owns(new) && owns(new + FOUR), "ownership follows both halves of the moved map");
+            assert_eq!(heap.mapped_ranges(), [(new, 2 * FOUR)]);
+        });
+        let _run = relax_session::phase::run();
+        unsafe { crate::memstat::Counting.dealloc(new as *mut u8, Layout::from_size_align(2 * FOUR, 8).unwrap()) };
+    }
+    let counts: [AtomicUsize; 3] = Default::default();
+    let ready = AtomicUsize::new(0);
+    let body = r#"
+        extern "C" {
+            fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, ...) -> *mut u8;
+            fn __errno_location() -> *mut i32;
+        }
+        fn fixture(args: *const usize) { unsafe {
+            let barrier: extern "C" fn(usize) -> bool = std::mem::transmute(*args);
+            let restored: extern "C" fn(usize) = std::mem::transmute(*args.add(1));
+            let moved: extern "C" fn(usize, usize, bool) = std::mem::transmute(*args.add(2));
+            let four = layout(4 * MIB);
+            let p = std::alloc::alloc(four);
+            assert!(!p.is_null());
+            p.write(57);
+            p.add(four.size() - 1).write(58);
+            let placed = barrier(p as usize);
+            let errno = __errno_location();
+            assert_eq!(mremap(p, four.size(), 8 * MIB, 0) as isize, -1);
+            assert_eq!(*errno, 12);
+            restored(p as usize);
+            let q = std::alloc::realloc(p, four, 8 * MIB);
+            assert!(!q.is_null() && q != p);
+            assert_eq!(q.read(), 57);
+            assert_eq!(q.add(four.size() - 1).read(), 58);
+            let before = counters()[1].load(Ordering::Relaxed);
+            moved(p as usize, q as usize, placed);
+            assert_eq!(counters()[1].load(Ordering::Relaxed), before + 1);
+            (&*(*args.add(3) as *const AtomicUsize)).store(1, Ordering::Release);
+            loop { std::thread::yield_now(); }
+        } }
+    "#;
+    let source = mapping_source_with_growth(body, &counts, r#"
+        let q = mremap(p, have, want, 1);
+        return if q as isize == -1 { std::ptr::null_mut() } else { q };
+    "#);
+    let (mut u, entry, root) = pa_fixture(&source);
+    let args = [barrier as *const () as usize, restored as *const () as usize, moved as *const () as usize, std::ptr::from_ref(&ready) as usize];
+    let (id, base, main) = try_launch_with(&mut u, entry, None, args.as_ptr() as u64, true).unwrap();
+    wait_mapping_stage(&ready, 1, &main, id);
+    with_mapping_heap(base, |heap| assert!(heap.mapped_ranges().is_empty()));
+    let end = end_run(&mut *u, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "fixture thread still running after end_run: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!(end.released.mappings, 0, "both the source and destination left the resource table clean");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_tracked_and_untracked_pa_logs_once_and_cleans_up_probe_maps() {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::AtomicUsize;
+    const CHILD: &str = "RELAX_TEST_MIXED_PA_PROBE";
+    if std::env::var_os(CHILD).is_none() {
+        let name = "domain::teardown_tests::mixed_tracked_and_untracked_pa_logs_once_and_cleans_up_probe_maps";
+        let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"]).env(CHILD, "1"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && stdout.contains("test result: ok. 1 passed"), "mixed allocator child: {stdout}{stderr}");
+        let identity = stdout.lines().find_map(|line| line.strip_prefix("mixed probe identity: ")).expect("allocator and native probe address");
+        let (path, addr) = identity.split_once(' ').unwrap();
+        let expected = format!("relax: the program's #[global_allocator] `{path}` returned {addr} for a 4194304-byte probe, outside the memory its domain owns (its heap, its statics and its tracked mappings) -- an untracked allocator (such as C code, sbrk, or a raw syscall): allocator routing is off for this domain, so provided crates' run ops use the domain's heap and any buffer freed or resized across the program/loader boundary may corrupt memory or abort");
+        assert_eq!(stderr.lines().filter(|&line| line == expected).count(), 1, "mixed allocator probe warning: {stderr}");
+        return;
+    }
+    static OUTSIDE: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn native_alloc(size: usize) -> *mut u8 {
+        extern "C" { fn malloc(size: usize) -> *mut u8; }
+        let p = unsafe { malloc(size) };
+        OUTSIDE.store(p as usize, Ordering::Release);
+        p
+    }
+    extern "C" fn native_free(p: *mut u8) {
+        extern "C" { fn free(p: *mut u8); }
+        unsafe { free(p) };
+    }
+    extern "C" fn check_routing() {
+        let l = Layout::from_size_align(4 << 20, 8).unwrap();
+        let _run = relax_session::phase::run();
+        unsafe {
+            let p = crate::memstat::Counting.alloc(l);
+            with_mapping_heap(current(), |heap| {
+                assert!(heap.ranges().any(|(a, n)| a <= p as usize && p as usize + l.size() <= a + n),
+                    "the run op's 4 MiB allocation went to the arena");
+            });
+            crate::memstat::Counting.dealloc(p, l);
+        }
+    }
+    let page = crate::os::mem::page_size() as usize;
+    let post_probe_len = 3 * page;
+    let (anon, fd) = if cfg!(target_vendor = "apple") { ("0x1000", "(240u32 << 24) as i32") } else { ("0x20", "-1") };
+    let source = r#"
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+        static FIRST: AtomicUsize = AtomicUsize::new(0);
+        static SECOND: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn map(len: usize) -> *mut u8 {
+            let p = mmap(std::ptr::null_mut(), len, 3, 2 | ANON_FLAG, ANON_FD, 0);
+            assert_ne!(p as isize, -1);
+            p
+        }
+        struct MixedAllocator;
+        #[global_allocator]
+        static ALLOCATOR: MixedAllocator = MixedAllocator;
+        unsafe impl GlobalAlloc for MixedAllocator {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                if l.align() == 8 && l.size() == 4 << 20 {
+                    let alloc: extern "C" fn(usize) -> *mut u8 = std::mem::transmute(NATIVE_ALLOCusize);
+                    return alloc(l.size());
+                }
+                if l.align() == 8 && l.size() == 16 && FIRST.load(Ordering::Acquire) == 0 {
+                    let p = map(OS_PAGE);
+                    FIRST.store(p as usize, Ordering::Release);
+                    return p;
+                }
+                if l.align() == 8 && l.size() == 4096 && SECOND.load(Ordering::Acquire) == 0 {
+                    let p = map(2 * OS_PAGE);
+                    SECOND.store(p as usize, Ordering::Release);
+                    return p;
+                }
+                System.alloc(l)
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                if p as usize == FIRST.load(Ordering::Acquire) || p as usize == SECOND.load(Ordering::Acquire) { return; }
+                if l.align() == 8 && l.size() == 4 << 20 {
+                    let free: extern "C" fn(*mut u8) = std::mem::transmute(NATIVE_FREEusize);
+                    free(p);
+                } else { System.dealloc(p, l); }
+            }
+        }
+        fn fixture(args: *const usize) { unsafe {
+            let op: extern "C" fn() = std::mem::transmute(*args);
+            op();
+            let shared = &*(*args.add(1) as *const [AtomicUsize; 3]);
+            let post = map(POST_LEN);
+            assert_eq!(munmap(FIRST.load(Ordering::Acquire) as *mut u8, OS_PAGE), 0);
+            shared[1].store(SECOND.load(Ordering::Acquire), Ordering::Relaxed);
+            shared[2].store(post as usize, Ordering::Relaxed);
+            shared[0].store(1, Ordering::Release);
+            loop { std::thread::yield_now(); }
+        } }
+    "#.replace("ANON_FLAG", anon).replace("ANON_FD", fd).replace("OS_PAGE", &page.to_string())
+        .replace("POST_LEN", &post_probe_len.to_string()).replace("NATIVE_ALLOC", &(native_alloc as *const () as usize).to_string())
+        .replace("NATIVE_FREE", &(native_free as *const () as usize).to_string());
+    let (mut u, entry, root) = pa_fixture(&source);
+    let path = u.prog.def_path(u.global_allocator_static().expect("the mixed allocator is bound"));
+    let shared: [AtomicUsize; 3] = Default::default();
+    let args = [check_routing as *const () as usize, shared.as_ptr() as usize];
+    let (id, base, main) = try_launch_with(&mut u, entry, None, args.as_ptr() as u64, true).expect("mixed allocator starts with routing off");
+    let addr = OUTSIDE.load(Ordering::Acquire);
+    assert_ne!(addr, 0);
+    println!("mixed probe identity: {path} {addr:#x}");
+    wait_mapping_stage(&shared[0], 1, &main, id);
+    let slab2 = shared[1].load(Ordering::Relaxed);
+    let post = shared[2].load(Ordering::Relaxed);
+    with_mapping_heap(base, |heap| assert_eq!(heap.mapped_ranges(), [(slab2, 2 * page)]));
+    let end = end_run(&mut *u, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "fixture thread still running after end_run: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(id);
+    assert_eq!((end.released.mappings, end.released.mapped_bytes), (1, post_probe_len as u64));
+    assert!(unmapped(slab2) && unmapped(post), "each owner released its survivor");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 // The same native op as the locked-op fixture, with a PA that can serve a static page,
 // decline large requests, or take a particular layout from the real process malloc.
 #[test]
@@ -2035,9 +2637,10 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "a refused probe leaves the run going: {err}");
     let prefix = format!("relax: the program's #[global_allocator] `{path}` returned 0x");
-    let suffix = " for a 16-byte probe, outside the memory its domain owns (its heap and its statics): it maps memory of its own, so the provided crates' run ops allocate in the domain's heap, not through it";
-    assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix))
-        .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "a refused probe says so in one line, with the address: {err}");
+    let suffix = " for a 16-byte probe, outside the memory its domain owns (its heap, its statics and its tracked mappings) -- an untracked allocator (such as C code, sbrk, or a raw syscall): allocator routing is off for this domain, so provided crates' run ops use the domain's heap and any buffer freed or resized across the program/loader boundary may corrupt memory or abort";
+    let matches = err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix))
+        .filter(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0));
+    assert_eq!(matches.count(), 1, "a refused probe reports its address exactly once: {err}");
     assert!(!err.contains("the process ends"), "routing-off allocations continue without the late diagnostic: {err}");
     for (case, size) in [("op", 73), ("jit", 96), ("resize", 96), ("nested", 64)] {
         let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
@@ -2047,7 +2650,7 @@ fn allocator_ranges_are_checked_before_main_and_at_the_op() {
         assert_eq!(std::os::unix::process::ExitStatusExt::signal(&out.status), Some(6), "{case}: an outside PA result aborts the child: {err}");
         #[cfg(not(unix))]
         assert!(!out.status.success(), "{case}: an outside PA result ends the child abnormally: {err}");
-        let suffix = format!(" ({size} bytes, align 8), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends");
+        let suffix = format!(" ({size} bytes, align 8), outside the memory its domain owns (its heap, its statics and its tracked mappings): under `makepad run` an allocator must sit on `System`, a static, or tracked anonymous mappings; the process ends");
         assert!(err.lines().filter_map(|line| line.strip_prefix(&prefix)?.strip_suffix(suffix.as_str()))
             .any(|addr| usize::from_str_radix(addr, 16).is_ok_and(|p| p != 0)), "{case}: late refusal names the allocator, address and layout: {err}");
     }

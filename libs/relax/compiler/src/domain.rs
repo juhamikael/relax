@@ -804,7 +804,7 @@ impl ProgramAllocatorCtx {
     unsafe extern "C" fn outside(ctx: usize, p: *mut u8, size: usize, align: usize) -> ! {
         let ctx = unsafe { &*(ctx as *const Self) };
         use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "relax: the program's #[global_allocator] `{}` returned {:#x} ({size} bytes, align {align}), outside the memory its domain owns (its heap and its statics): under `makepad run` an allocator must sit on `System` or a static; the process ends", ctx.path, p as usize);
+        let _ = writeln!(std::io::stderr(), "relax: the program's #[global_allocator] `{}` returned {:#x} ({size} bytes, align {align}), outside the memory its domain owns (its heap, its statics and its tracked mappings): under `makepad run` an allocator must sit on `System`, a static, or tracked anonymous mappings; the process ends", ctx.path, p as usize);
         crate::os::fault::die_by(6)
     }
 
@@ -813,9 +813,8 @@ impl ProgramAllocatorCtx {
         ctx.call(|| unsafe { (ctx.dealloc)(p, size, align) })
     }
 
-    // The probe is a heuristic. The check at every routed allocation is the rule. Ok(Some(line)):
-    // a probe block was outside the memory the domain owns (an allocator over its own mappings,
-    // sbrk or another process-wide heap), so nothing may route through the allocator.
+    // A probe can expose an untracked source such as native C code, sbrk, a raw syscall,
+    // or a file-backed mapping. Every later routed allocation still checks its own block.
     fn probe(&self) -> Result<Option<String>, String> {
         let interrupted = || format!("global allocator `{}` probe interrupted", self.path);
         for (size, align) in [(16, 8), (4096, 8), (4096, 4096), (256 << 10, 8), (4 << 20, 8)] {
@@ -829,7 +828,7 @@ impl ProgramAllocatorCtx {
             let freed = unsafe { Self::dealloc(std::ptr::from_ref(self) as usize, block, size, align) };
             if !freed { return Err(interrupted()); }
             if !owned {
-                return Ok(Some(format!("relax: the program's #[global_allocator] `{}` returned {:#x} for a {size}-byte probe, outside the memory its domain owns (its heap and its statics): it maps memory of its own, so the provided crates' run ops allocate in the domain's heap, not through it", self.path, block as usize)));
+                return Ok(Some(format!("relax: the program's #[global_allocator] `{}` returned {:#x} for a {size}-byte probe, outside the memory its domain owns (its heap, its statics and its tracked mappings) -- an untracked allocator (such as C code, sbrk, or a raw syscall): allocator routing is off for this domain, so provided crates' run ops use the domain's heap and any buffer freed or resized across the program/loader boundary may corrupt memory or abort", self.path, block as usize)));
             }
         }
         Ok(None)
@@ -873,8 +872,8 @@ impl ProgramHeap {
         if let Some(allocator) = allocator {
             match allocator.probe() {
                 Err(error) => return fail(loading.0, vec![error]),
-                // Nothing was routed yet: the heap goes on as one without a program allocator,
-                // as before routing existed (a mapping allocator, an app's large blocks on macOS)
+                // Tracked anonymous mappings pass the probe. Only an untracked source
+                // takes this fallback, including allocations made inside native C bundles.
                 Ok(Some(line)) => {
                     eprintln!("{line}");
                     let ds = domains();
