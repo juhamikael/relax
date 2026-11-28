@@ -735,12 +735,12 @@ fn rle_to_bmp(w: u32, h: u32, rle: &[u8]) -> Result<Vec<u8>, String> {
 fn gseq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
     crate::params::validate(kv.iter().map(|(k, _)| k.as_str()), crate::params::GSEQ)?;
     let n = match get(kv, &["n"]).unwrap_or("8").parse::<usize>() {
-        Ok(n @ 1..=64) => n,
-        _ => return Err("gseq n must be an integer in 1..=64".into()),
+        Ok(n @ 1..) => n,
+        _ => return Err("gseq n must be a positive integer".into()),
     };
     let every_ms = match get(kv, &["every_ms"]).unwrap_or("50").parse::<u64>() {
-        Ok(ms @ 8..=60_000) if ms * (n as u64 - 1) <= 60_000 => ms,
-        _ => return Err("gseq every_ms must be 8..=60000; total cadence span must not exceed 60s".into()),
+        Ok(ms @ 8..=60_000) => ms,
+        _ => return Err("gseq every_ms must be 8..=60000".into()),
     };
     let dir = match get(kv, &["out"]) {
         Some(d) => {

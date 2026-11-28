@@ -1055,8 +1055,23 @@ fn gseq_writes_n_frames_with_timings_and_validates() {
     let (_, err) = run_app(&["gseq", "n=2", &format!("out={}", dir.display())]);
     assert!(!err);
     assert!(dir.join("grab-w1-00005.png").exists());
-    // too many frames, too fast, or a span over 60 s: refused before anything is asked of the app
-    for bad in [&["gseq", "n=0"][..], &["gseq", "n=65"], &["gseq", "every_ms=7"], &["gseq", "n=64", "every_ms=1000"]] {
+    // more than 64 frames, and a span over 60 s, are paced through, never refused; gseq pins
+    // every frame it wrote, so all 65 stay on disk
+    let expected: Vec<String> = (1..=65).map(|i| format!("grab-w1-{i:05}.png")).collect();
+    for every_ms in ["every_ms=20", "every_ms=1000"] {
+        let long = scratch("gseq65");
+        let (lines, err) = run_app(&["gseq", "n=65", every_ms, &format!("out={}", long.display())]);
+        assert!(!err, "{every_ms}: {lines:?}");
+        let mut names: Vec<String> = std::fs::read_dir(&long).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, expected, "{every_ms}");
+        if every_ms == "every_ms=1000" {
+            assert!(lines[0].contains("\"n\":65,\"every_ms\":1000") && lines[0].contains("\"scheduled_ms\":64000"), "{lines:?}");
+        }
+        let _ = std::fs::remove_dir_all(&long);
+    }
+    // no frames, too fast or too slow a gap: refused before anything is asked of the app
+    for bad in [&["gseq", "n=0"][..], &["gseq", "every_ms=7"], &["gseq", "every_ms=60001"]] {
         let (lines, err) = run_app(bad);
         assert!(err && lines.len() == 1 && lines[0].starts_with("{\"err\":\"gseq "), "{bad:?}: {lines:?}");
     }
