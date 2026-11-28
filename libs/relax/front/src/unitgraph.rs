@@ -538,6 +538,8 @@ pub enum ScriptRole {
     Answered(Vec<String>),
     /// a Relax crate's own source stamp (libs/relax/self_stamp.rs): answered by `self_stamp_text`
     SelfStamp,
+    /// The compiler's source stamp, codegen parts, std digest and JIT provenance.
+    RelaxCompiler,
     /// to be removed from the source
     ToRemove,
 }
@@ -551,6 +553,7 @@ pub fn script_role(pkg: &str, bs: &BuildScript) -> ScriptRole {
         // Relax's crates compiled from source by a program (makepad-script-compute's non-provided
         // code reaches relax-backend): their script only writes the source stamp
         "relax-base" | "relax-lex" | "relax-session" | "relax-types" | "relax-backend" | "relax-codegen" | "relax-front" => ScriptRole::SelfStamp,
+        "relax-compiler" => ScriptRole::RelaxCompiler,
         _ if bs.kept => ScriptRole::Artefact,
         // pkg-config probes: the libraries of the enabled features (none with dlopen)
         "wayland-sys" => {
@@ -837,7 +840,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     if sess.options.no_codegen {
         for bs in &g.build_scripts {
             let (_, pname, _) = &g.pkg[bs.krate];
-            if !matches!(script_role(pname, bs), ScriptRole::Native(_) | ScriptRole::SelfStamp) && !noop::script(bs, &g.raw) {
+            if !matches!(script_role(pname, bs), ScriptRole::Native(_) | ScriptRole::SelfStamp | ScriptRole::RelaxCompiler) && !noop::script(bs, &g.raw) {
                 return Err(format!("build scripts are not supported in no-codegen mode: {} ({})", pname, bs.src_path));
             }
         }
@@ -1100,6 +1103,13 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                     Ok(String::new())
                 })();
                 done(i, r, out_dir, false);
+                continue;
+            }
+            ScriptRole::RelaxCompiler => {
+                match relax_compiler_answer(g, bs, root) {
+                    Ok((out_dir, lines)) => done(i, Ok(lines.join("\n")), out_dir, false),
+                    Err(e) => done(i, Err(e), String::new(), false),
+                }
                 continue;
             }
             ScriptRole::Native(a) => {
@@ -2869,6 +2879,114 @@ fn self_stamp_text(pkg: &str, features: &[String]) -> String {
     format!("/// This crate's source stamp (libs/relax/self_stamp.rs).\npub const SRC_STAMP: u128 = 0x{:032x};\n", stamp)
 }
 
+/// The shipped std's digest uses the same relative paths and bytes as the native build.
+fn compiler_std_digest(dir: &str) -> Result<String, String> {
+    let root = format!("{dir}/std");
+    let mut files = Vec::new();
+    let mut folders = vec![String::new()];
+    while let Some(prefix) = folders.pop() {
+        let folder = format!("{root}/{prefix}");
+        for (name, is_dir) in crate::vfs::read_dir(&folder).map_err(|e| format!("{folder}: {e}"))? {
+            let rel = format!("{prefix}{name}");
+            if is_dir {
+                folders.push(format!("{rel}/"));
+            } else {
+                let path = format!("{root}/{rel}");
+                let bytes = crate::vfs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+                files.push((rel, bytes));
+            }
+        }
+    }
+    Ok(relax_base::std_digest::digest(files))
+}
+
+fn stable_pkg_stamp(name: &str, version: &str, mut features: Vec<&str>) -> u128 {
+    features.sort_unstable();
+    features.dedup();
+    let mut bytes = Vec::from(&b"relax-jit-part"[..]);
+    for part in [name, version].into_iter().chain(features) {
+        bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(part.as_bytes());
+    }
+    let digest = relax_base::sha256::sha256(&bytes);
+    u128::from_le_bytes(digest[..16].try_into().unwrap())
+}
+
+/// The compiler's library closure, including the dependencies used on the host for macros.
+fn compiler_codegen_parts(g: &Graph, ci: usize, relax_dir: &std::path::Path) -> String {
+    let mut stamped = Vec::new();
+    let mut packages: std::collections::BTreeMap<(&str, &str), Vec<&str>> = Default::default();
+    let mut seen = vec![false; g.crates.len()];
+    let mut stack = vec![ci];
+    while let Some(k) = stack.pop() {
+        let unit = &g.crates[k];
+        if std::mem::replace(&mut seen[k], true) || matches!(unit.name.as_str(), "core" | "alloc" | "std" | "proc_macro" | "test") {
+            continue;
+        }
+        stack.extend(unit.deps.iter().map(|d| d.0));
+        if let Some(host) = &unit.host {
+            stack.extend(host.deps.iter().map(|d| d.0));
+        }
+        let (dir, name, version) = &g.pkg[k];
+        if std::path::Path::new(&crate::vfs::canonical(dir)).starts_with(relax_dir) {
+            stamped.push(name.as_str());
+        } else {
+            let features = packages.entry((name, version)).or_default();
+            features.extend(unit.features.iter().map(String::as_str));
+            if let Some(host) = &unit.host {
+                features.extend(host.features.iter().map(String::as_str));
+            }
+        }
+    }
+    stamped.sort_unstable();
+    stamped.dedup();
+    let mut others: Vec<_> = packages.into_iter().map(|((name, version), features)| (name, stable_pkg_stamp(name, version, features))).collect();
+    others.sort_unstable();
+    others.dedup();
+    let mut out = String::from("pub(crate) const CODEGEN_PARTS: &[(&str, u128)] = &[\n");
+    for name in stamped {
+        let lib = if name == "relax-compiler" { "crate".to_string() } else { name.replace('-', "_") };
+        out.push_str(&format!("    ({name:?}, {lib}::SRC_STAMP),\n"));
+    }
+    for (name, stamp) in others {
+        out.push_str(&format!("    ({name:?}, 0x{stamp:032x}),\n"));
+    }
+    out.push_str("];\n");
+    out
+}
+
+fn relax_compiler_answer(g: &Graph, bs: &BuildScript, root: &BuildRoot) -> Result<(String, Vec<String>), String> {
+    let dir = &g.pkg[bs.krate].0;
+    let parent = std::path::Path::new(dir).parent().ok_or_else(|| format!("no parent for compiler directory {dir}"))?;
+    let relax = crate::vfs::canonical(&parent.to_string_lossy());
+    let src_stamp = self_stamp_text("relax-compiler", &bs.features);
+    let parts = compiler_codegen_parts(g, bs.krate, std::path::Path::new(&relax));
+    let digest = compiler_std_digest(dir)?;
+    let name = script_name(g, bs);
+    let build_dir = if crate::vfs::in_folder(dir) {
+        let mut hash = crate::sip::Sip128::new();
+        for text in [&src_stamp, &parts, &digest] {
+            hash.str(text);
+        }
+        root.take(&format!("{name}-answered-{:016x}", hash.finish128() as u64))
+    } else {
+        root.take(&format!("{name}-answered"))
+    };
+    let out_dir = format!("{build_dir}/out");
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
+    for (file, text) in [("src_stamp.rs", src_stamp), ("codegen_parts.rs", parts)] {
+        let path = format!("{out_dir}/{file}");
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+            let tmp = format!("{}.tmp{}-{}", path, std::process::id(), TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("{path}: {e}")
+            })?;
+        }
+    }
+    Ok((out_dir, vec![format!("cargo:rustc-env=RELAX_STD_DIGEST={digest}"), "cargo:rustc-env=RELAX_PROVENANCE=makepad jit-run jit jit-run".to_string()]))
+}
+
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Who this run works for, as whatever started it names it (`RELAX_RUN_OWNER`: a build farm's
@@ -3029,6 +3147,129 @@ mod shared_script_tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn compiler_graph(ws: &Path) -> Graph {
+        let unit = |dir: &str, name: &str, deps: &[usize]| {
+            let dir = crate::vfs::normalize_path(&ws.join(dir).to_string_lossy());
+            GraphUnit {
+                pkg_id: format!("path+file://{dir}#{name}@1.0.0"), src_path: format!("{dir}/src/lib.rs"),
+                name: name.replace('-', "_"), kind: vec!["lib".into()], mode: "build".into(),
+                deps: deps.iter().map(|&d| (d, String::new())).collect(), ..Default::default()
+            }
+        };
+        let compiler = "relax/compiler";
+        let script = GraphUnit {
+            kind: vec!["custom-build".into()], mode: "run-custom-build".into(),
+            src_path: ws.join(compiler).join("build.rs").display().to_string(), ..unit(compiler, "relax-compiler", &[])
+        };
+        let units = vec![
+            GraphUnit { mode: "test".into(), ..unit(compiler, "relax-compiler", &[1, 2]) },
+            unit(compiler, "relax-compiler", &[2, 3, 4]),
+            script,
+            unit("relax/base", "relax-base", &[]),
+            unit("support", "support", &[]),
+            GraphUnit { host: true, ..unit("relax/base", "relax-base", &[6, 7]) },
+            unit("helper", "helper", &[]),
+            GraphUnit { sysroot: true, ..unit("relax/compiler/std/proc_macro", "proc_macro", &[]) },
+            unit("unused", "unused", &[]),
+        ];
+        load(&Units { units, roots: vec![0], ..Default::default() }, false, false).unwrap()
+    }
+
+    fn compiler_fixture(ws: &Path) -> BuildRoot {
+        for dir in ["relax/compiler/src", "relax/compiler/std/core", "relax/base"] {
+            std::fs::create_dir_all(ws.join(dir)).unwrap();
+        }
+        std::fs::write(ws.join("relax/compiler/std/core/lib.rs"), "core").unwrap();
+        std::fs::write(ws.join("relax/compiler/std/table"), [0, 255]).unwrap();
+        BuildRoot::at(ws.join("build"), ws.display().to_string(), &["compiler"])
+    }
+
+    #[test]
+    fn relax_compiler_script_role_is_in_process() {
+        let ws = scratch("compiler-role");
+        let root = compiler_fixture(&ws);
+        let g = compiler_graph(&ws);
+        let bs = &g.build_scripts[0];
+        assert!(matches!(script_role("relax-compiler", bs), ScriptRole::RelaxCompiler));
+        let (out, lines) = relax_compiler_answer(&g, bs, &root).unwrap();
+        let digest = relax_base::std_digest::digest(vec![("table".into(), vec![0, 255]), ("core/lib.rs".into(), b"core".to_vec())]);
+        assert_eq!(lines, [format!("cargo:rustc-env=RELAX_STD_DIGEST={digest}"), "cargo:rustc-env=RELAX_PROVENANCE=makepad jit-run jit jit-run".to_string()]);
+        let stamp = std::fs::read_to_string(Path::new(&out).join("src_stamp.rs")).unwrap();
+        assert_eq!(stamp, self_stamp_text("relax-compiler", &bs.features));
+        let helper = stable_pkg_stamp("helper", "1.0.0", vec![]);
+        let support = stable_pkg_stamp("support", "1.0.0", vec![]);
+        let parse_stamp = |text: &str| u128::from_str_radix(text.split("0x").nth(1).unwrap().trim_end_matches(";\n"), 16).unwrap();
+        let mut stamps = vec![parse_stamp(&stamp), parse_stamp(&self_stamp_text("relax-base", &[])), helper, support];
+        stamps.sort_unstable();
+        stamps.dedup();
+        assert_eq!(stamps.len(), 4, "each package has its own stamp");
+        let parts = std::fs::read_to_string(Path::new(&out).join("codegen_parts.rs")).unwrap();
+        assert_eq!(parts, format!(concat!(
+            "pub(crate) const CODEGEN_PARTS: &[(&str, u128)] = &[\n",
+            "    (\"relax-base\", relax_base::SRC_STAMP),\n    (\"relax-compiler\", crate::SRC_STAMP),\n",
+            "    (\"helper\", 0x{:032x}),\n    (\"support\", 0x{:032x}),\n];\n"), helper, support),
+            "include the host dependency and list each package in the library closure once");
+        std::fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn relax_compiler_answer_invariant_under_rs_edit() {
+        let ws = scratch("compiler-edit");
+        let root = compiler_fixture(&ws);
+        let mount = ws.join("mounted");
+        crate::vfs::mount_folder(&mount.to_string_lossy(), &ws);
+        let source = ws.join("relax/compiler/src/lib.rs");
+        let mut outputs = Vec::new();
+        for checkout in [&ws, &mount] {
+            let g = compiler_graph(checkout);
+            let answer = || {
+                let (out, lines) = relax_compiler_answer(&g, &g.build_scripts[0], &root).unwrap();
+                let stamp = std::fs::read_to_string(Path::new(&out).join("src_stamp.rs")).unwrap();
+                let parts = std::fs::read_to_string(Path::new(&out).join("codegen_parts.rs")).unwrap();
+                (out, lines, stamp, parts)
+            };
+            std::fs::write(&source, "fn f() {}\n").unwrap();
+            let before = answer();
+            std::fs::write(&source, "fn f() {} // edited\n").unwrap();
+            assert_eq!(answer(), before, "a source edit under {} keeps every output", checkout.display());
+            outputs.push(before.0);
+        }
+        assert_ne!(outputs[0], outputs[1], "the folder mount has a content-keyed output directory");
+        std::fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn relax_compiler_std_edit_updates_std_digest() {
+        fn copy_tree(src: &Path, dest: &Path) {
+            std::fs::create_dir_all(dest).unwrap();
+            for (name, is_dir) in crate::vfs::read_dir(src).unwrap() {
+                if is_dir {
+                    copy_tree(&src.join(&name), &dest.join(&name));
+                } else {
+                    std::fs::write(dest.join(&name), crate::vfs::read(src.join(&name)).unwrap()).unwrap();
+                }
+            }
+        }
+        let ws = scratch("compiler-std-edit");
+        let std = ws.join("relax/compiler/std");
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("compiler/std");
+        copy_tree(&shipped, &std);
+        let root = BuildRoot::at(ws.join("build"), ws.display().to_string(), &["compiler"]);
+        let mount = ws.join("mounted");
+        crate::vfs::mount_folder(&mount.to_string_lossy(), &ws);
+        let g = compiler_graph(&mount);
+        let answer = || {
+            let (out, lines) = relax_compiler_answer(&g, &g.build_scripts[0], &root).unwrap();
+            (out, lines.into_iter().find(|l| l.starts_with("cargo:rustc-env=RELAX_STD_DIGEST=")).unwrap())
+        };
+        let before = answer();
+        std::fs::write(std.join("core/lib.rs"), "// edited std\n").unwrap();
+        let after = answer();
+        assert_ne!(after.1, before.1, "changed std bytes change RELAX_STD_DIGEST");
+        assert_ne!(after.0, before.0, "a mounted checkout retains the output of each std");
+        std::fs::remove_dir_all(ws).unwrap();
     }
 
     /// A shared workspace's script output (vfs.rs SHARE) is keyed and named by what its inputs
